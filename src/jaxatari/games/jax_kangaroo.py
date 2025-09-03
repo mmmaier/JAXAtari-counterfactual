@@ -2031,6 +2031,10 @@ class KangarooRenderer(JAXGameRenderer):
             loaded_sprite = _load_sprite_frame(name)
             if loaded_sprite is not None:
                 sprites[name] = loaded_sprite
+        # import ipdb; ipdb.set_trace()
+        #s = sprites['ape_climb_left']
+        #plt.imshow(s)
+        #plt.show()
 
         # pad the kangaroo and monkey sprites since they have to be used interchangeably (and jax enforces same sizes)
         ape_sprites, ape_pivots = jr.pad_to_match([
