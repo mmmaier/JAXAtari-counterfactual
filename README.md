@@ -144,6 +144,58 @@ python3 scripts/play.py -g Pong
 
 ---
 
+
+## Counterfactual Scene Creation Tools
+
+This fork adds two utility scripts for generating **counterfactual Atari scenes** and
+for recording gameplay together with rich state metadata. These tools are used in
+the *ThinkRL* project to create structured datasets for counterfactual reasoning
+and scene editing.
+
+### scripts/counterfactual_renderer.py
+
+Render a saved game state (.pkl or .json) and insert external PNG assets into the frame at arbitrary coordinates.
+This enables controlled scene manipulation for robustness testing, dataset augmentation, interpretability, and causal experiments.
+
+Example: insert a rope in the middle of the second platform
+
+```bash
+python3 scripts/counterfactual_renderer.py Kangaroo frames/state_00001.pkl --extra-png 50 78 scripts/assets/rope.png --size 40 40
+```
+
+The script loads the stored JAXAtari environment state, applies overlays, and displays (or saves) the resulting counterfactual frame.
+
+### play_save_frames.py
+
+This script allows you to play an Atari game and save every n-th frame as .png together with the full environment state (.pkl via dill).
+Moreover, there will be a wrapped up .pkl file prepared that stores all information as required for the ThinkRL project containing the pixel frame, object-centric metadata, action, reward, and done flags, etc.
+
+This produces ThinkRL-ready frame/state datasets.
+
+Example: save every 50th frame
+
+```bash
+python3 scripts/play_save_frames.py \
+  --game Kangaroo \
+  --output-folder folder_name \
+  --save-every 50 \
+  --max-saved-frames 2000
+```
+
+Files are stored as:
+
+frames/folder_name/
+    frame_00000.png
+    frame_00001.png
+    ...
+    state_00000.pkl
+    state_00001.pkl
+    ...
+    dataset_0.pkl
+
+These .pkl files can be loaded directly by counterfactual_renderer.py to produce modified scenes.
+
+
 ## Supported Games
 
 | Game     | Supported |

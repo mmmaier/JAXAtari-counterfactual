@@ -100,7 +100,6 @@ def main():
 
     # initialize the environment
     obs, state = jitted_reset(key)
- #   import ipdb; ipdb.set_trace()
 
     # setup pygame if we are rendering
     if not execute_without_rendering:
