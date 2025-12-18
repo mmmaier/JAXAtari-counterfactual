@@ -63,6 +63,84 @@ def objects_to_string(struct_obs, defaults=DEFAULT_SIZES):
 
     return "[" + ", ".join(parts) + "]"
 
+def xy(pos):
+    if pos is None:
+        return None
+
+    # unwrap [[x,y]] -> [x,y]
+    if isinstance(pos, (list, tuple)) and len(pos) == 1 and isinstance(pos[0], (list, tuple)):
+        pos = pos[0]
+
+    if not (isinstance(pos, (list, tuple)) and len(pos) >= 2):
+        return None
+
+    x, y = pos[0], pos[1]
+    if x == -1 or y == -1:
+        return None
+    return int(x), int(y)
+
+def objects_from_struct_obs(struct_obs: dict, default_sizes: dict):
+    """
+    Generic object extraction:
+    - *_positions: list of (x,y)
+    - *_position: single (x,y)
+    - player_x/player_y: single (x,y)
+    Everything becomes a list of dicts with category, x,y,w,h.
+    """
+    objs = []
+
+    def add_obj(category, x, y):
+        if x is None or y is None:
+            return
+        x, y = int(x), int(y)
+        if x == -1 or y == -1:
+            return
+        w, h = default_sizes.get(category, (0, 0))
+        objs.append({"category": category, "x": x, "y": y, "w": int(w), "h": int(h)})
+
+    # Special case: player_x/player_y naming (common)
+    if "player_x" in struct_obs and "player_y" in struct_obs:
+        add_obj("Player", struct_obs["player_x"], struct_obs["player_y"])
+
+    for key, val in struct_obs.items():
+        # skip player_x/player_y since handled above
+        if key in ("player_x", "player_y"):
+            continue
+
+        # list of positions: e.g., fruit_positions, ladder_positions
+        if key.endswith("_positions") and isinstance(val, (list, tuple)):
+            category = key[:-10].replace("_", " ").title().replace(" ", "")  # fruit_positions -> Fruit
+            for xy in val:
+                if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                    add_obj(category, xy[0], xy[1])
+
+        # single position: e.g., child_position, bell_position
+        elif key.endswith("_position") and isinstance(val, (list, tuple)):
+            category = key[:-9].replace("_", " ").title().replace(" ", "")  # child_position -> Child
+
+            # Case A: [x, y]
+            if len(val) >= 2 and isinstance(val[0], (int, float)) and isinstance(val[1], (int, float)):
+                add_obj(category, val[0], val[1])
+
+            # Case B: [[x, y]] or [[x, y], [x2, y2], ...]
+            elif len(val) >= 1 and isinstance(val[0], (list, tuple)) and len(val[0]) >= 2:
+                for xy in val:
+                    if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                        add_obj(category, xy[0], xy[1])
+
+    return objs
+
+
+def objects_to_string_from_list(objs):
+    parts = []
+    for o in objs:
+        cat = o.get("category", "Unknown")
+        x, y = o.get("x", -1), o.get("y", -1)
+        w, h = o.get("w", 0), o.get("h", 0)
+        parts.append(f"{cat} at ({int(x)}, {int(y)}), ({int(w)}, {int(h)})")
+    return "[" + ", ".join(parts) + "]"
+
+
 def objects_to_list(struct_obs, defaults=DEFAULT_SIZES):
     parts = []
 
@@ -105,11 +183,9 @@ def to_serializable(obj):
 
 
 def obs_to_json(obs, path="obs.json"):
-    """Convert KangarooObservation (NamedTuple) into JSON."""
-    obs_dict = {name: (value.tolist() if isinstance(value, (np.ndarray, jax.Array)) else value)
-                for name, value in obs._asdict().items()}
-    
-    with open(path, "w") as f:
+    """Convert observation (NamedTuple-like) into JSON using to_serializable."""
+    obs_dict = to_serializable(obs._asdict())
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(obs_dict, f, indent=2)
 
 
@@ -119,14 +195,11 @@ def save_frame(image, path):
     img.save(path)
 
 
-def main(output_folder):
+def main():
     # --- dataset logging setup ---
-    save_stride = args.save_every     # every nth frame
     rows = []                         # will hold dict rows for the pkl DataFrame
     episode = 0
 
-    save_dir = os.path.join(os.getcwd(), "frames", args.output_folder)
-    os.makedirs(save_dir, exist_ok=True)
 
     parser = argparse.ArgumentParser(
         description="Play a JAXAtari game, record your actions or replay them."
@@ -202,6 +275,10 @@ def main(output_folder):
     )
 
     args = parser.parse_args()
+
+    save_stride = args.save_every     # every nth frame
+    save_dir = os.path.join(os.getcwd(), "frames", args.output_folder)
+    os.makedirs(save_dir, exist_ok=True)
 
     execute_without_rendering = False
     # Load the game environment
@@ -358,16 +435,32 @@ def main(output_folder):
 
             # Every 50th frame, log transition
             if step_idx % save_stride == 0:
+                prev_struct = struct_from_obs(prev_obs)
+                next_struct = struct_from_obs(next_obs)
+
+                prev_objs = objects_from_struct_obs(prev_struct, DEFAULT_SIZES)
+                next_objs = objects_from_struct_obs(next_struct, DEFAULT_SIZES)
+
+                cocos = prev_struct.get("coco_positions", [])
+                if any((x != -1 and y != -1) for x, y in cocos):
+                    print("FOUND COCO:", cocos)
+
+                falling = prev_struct.get("falling_coco_position")
+                if isinstance(falling, (list, tuple)) and len(falling) >= 2:
+                    if falling[0] != -1 and falling[1] != -1:
+                        print("FOUND FALLING COCO:", falling)
+
                 # Build one row matching the dataset structure
                 row = {
                     "index": f"{episode:05d}_{save_idx:05d}",
                     "obs": prev_image,
                     "next_obs": next_image,
-                    "objects": objects_to_string(prev_struct),
-                    "next_objects": objects_to_string(struct_from_obs(next_obs)),
-                    "action": np.float32(action),              # <- enforce float32
-                    "reward": np.float32(reward),              # <- enforce float32
-                    "original_reward": np.float32(getattr(info, "raw_reward", reward)),  # <- enforce float32
+                    "struct": prev_struct,
+                    "objects": objects_to_string_from_list(prev_objs),
+                    "next_objects": objects_to_string_from_list(next_objs),
+                    "action": np.float32(action),              
+                    "reward": np.float32(reward),              
+                    "original_reward": np.float32(getattr(info, "raw_reward", reward)),
                     "done": bool(done),
                 }
                 rows.append(row)
@@ -419,7 +512,7 @@ def main(output_folder):
     if rows:
         import pandas as pd
         df = pd.DataFrame(rows, columns=[
-            "index", "obs", "next_obs", "objects", "next_objects",
+            "index", "obs", "next_obs", "struct", "objects", "next_objects",
             "action", "reward", "original_reward", "done"
         ])
         out_pkl = os.path.join(save_dir, f"dataset_{episode}.pkl")
@@ -430,4 +523,4 @@ def main(output_folder):
 
 
 if __name__ == "__main__":
-    main("3_normal_4")
+    main()
