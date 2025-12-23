@@ -2,12 +2,69 @@ import jax
 import jax.numpy as jnp
 import chex
 from functools import partial
+from typing import Tuple
 
 from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
 from jaxatari.games.jax_kangaroo import KangarooState, PlayerState, LevelState, KangarooConstants
 from jaxatari.games.kangaroo_levels import LevelConstants, Kangaroo_Level_1, Kangaroo_Level_2, Kangaroo_Level_3
 
 # --- 1. Internal Mods (Group 1) ---
+class NoBellMod(JaxAtariInternalModPlugin):
+    """
+    Internal mod to disable the Bell.
+    Patches '_bell_step'.
+    """
+    
+    @partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
+    def _bell_step(self, state: KangarooState):
+        """
+        No-op override for _bell_step.
+        Returns 0 for the timer and False for the respawn flag, 
+        effectively disabling the bell mechanics.
+        """
+        return jnp.zeros_like(state.level.bell_timer), jnp.array(False)
+
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_bell(self, raster: jnp.ndarray, state: KangarooState):
+        """
+        Overrides the KangarooRenderer._draw_bell method.
+        Draws a static sprite (no animation) shifted 4 pixels up.
+        """
+
+        return raster
+
+
+class NoFruitMod(JaxAtariInternalModPlugin):
+    """
+    Internal mod to remove Fruits.
+    Patches '_fruits_step'.
+    """   
+
+    @partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
+    def _fruits_step(self, state: KangarooState):
+        """
+        Override for _fruits_step to remove fruits.
+        """
+        # We must still call _bell_step because the environment logic 
+        # normally chains these together.
+        bell_timer, _ = self._env._bell_step(state)
+
+        return (
+            jnp.zeros((), dtype=jnp.int32),                             # Score addition
+            jnp.zeros_like(state.level.fruit_actives, dtype=jnp.bool_), # Set actives to False (Hides them visually)
+            state.level.fruit_stages,                                   # Keep stages (irrelevant since inactive)
+            bell_timer                                                  # Pass through the bell timer
+        )
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_single_fruit(self, i, raster, state: KangarooState):
+        """
+        Overrides the KangarooRenderer._draw_fruits method.
+        Does not draw any fruits.
+        """
+        return raster
+
 
 class NoMonkeyMod(JaxAtariInternalModPlugin):
     """
@@ -400,7 +457,105 @@ class ReplaceChildWithMonkeyMod(JaxAtariInternalModPlugin):
 
 # Multiple Plugins to change bell to a fire (bundled into *modpack* in the kangaroo_mods.py file)
 
+
+class ReplaceMonkeyWithTankMod(JaxAtariInternalModPlugin):
+    asset_overrides = {
+        "ape": {
+            'name': 'ape',
+            'type': 'group',
+            'files': ['tank.npy']
+        }
+    }
+
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_single_monkey(self, i, raster, state: KangarooState):
+        """
+        Draws a single monkey based on index i. 
+        Designed to be called within a jax.lax.fori_loop.
+        """
+        state_idx = state.level.monkey_states[i].astype(int)
+        pos = state.level.monkey_positions[i]
+
+        x, y = pos
+        
+        # Map game state to sprite index
+        monkey_sprite_idx = jnp.array([0, 1, 2, 3, 2, 4])[state_idx] 
+        
+        is_walking = (state_idx == 2) | (state_idx == 4)
+        use_standing_anim = is_walking & ((state.level.step_counter % 32) < 16)
+        
+        # Index 0 is 'standing'
+        final_sprite_idx = jax.lax.select(use_standing_anim, 0, monkey_sprite_idx) 
+        
+        monkey_mask = self._env.renderer.SHAPE_MASKS["ape"][final_sprite_idx]
+        flip_offset = self._env.renderer.FLIP_OFFSETS["ape"]
+        flip_h = (state_idx == 4)
+        should_draw = (state_idx != 0)
+        
+        draw_fn = lambda r: self._env.renderer.jr.render_at_clipped(
+            r, 
+            x-7, 
+            y-5, 
+            monkey_mask, 
+            flip_horizontal=flip_h, 
+            flip_offset=flip_offset
+        )
+        
+        return jax.lax.cond(should_draw, draw_fn, lambda r: r, raster)
+
+
 # --- MOD A: Replace Bell Sprite + Patch Animation ---
+class ReplaceBellWithCactusMod(JaxAtariInternalModPlugin):
+    """
+    Replaces the 'bell' asset group with a new 'cactus' asset group.
+    
+    Expects 'cactus.npy' to exist.
+    """
+    
+    # 1. Swap the assets (using Method 2: manually overriding a key in the asset_overrides dict)
+    asset_overrides = {
+        "bell": {
+            'name': 'bell', 
+            'type': 'group',
+            'files': ['cactus_tall.npy']
+        }
+    }
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_bell(self, raster: jnp.ndarray, state: KangarooState):
+        """
+        Overrides the KangarooRenderer._draw_bell method.
+        Draws a static sprite (no animation) shifted 4 pixels up.
+        """
+        jr = self._env.renderer.jr
+        
+        # CHANGED: Removed flicker logic. Hardcoded to index 0 for a static image.
+        flame_idx = 0 
+        
+        # We use "bell" as the key because our override mapped to it
+        flame_mask = self._env.renderer.SHAPE_MASKS["bell"][flame_idx]
+        flame_offset = self._env.renderer.FLIP_OFFSETS["bell"]
+        
+        # Keep original logic for *when* to draw
+        should_draw_flame = (state.level.bell_position[0] != -1) & ~jnp.any(state.level.fruit_stages == 3)
+        
+        # CHANGED: Adjusted Y position logic inside render_at
+        raster = jax.lax.cond(should_draw_flame,
+            lambda r: jr.render_at(
+                r, 
+                state.level.bell_position[0].astype(int), 
+                # CHANGED: Subtract 4 from Y to move it up
+                state.level.bell_position[1].astype(int) - 8, 
+                flame_mask, 
+                flip_horizontal=jnp.array(False),
+                flip_offset=flame_offset
+            ),
+            lambda r: r, 
+            raster
+        )
+        return raster
+
+
 
 class ReplaceBellWithFlameMod(JaxAtariInternalModPlugin):
     """
@@ -453,6 +608,229 @@ class ReplaceBellWithFlameMod(JaxAtariInternalModPlugin):
             raster
         )
         return raster
+
+class ReplaceLadderWithChainMod(JaxAtariInternalModPlugin):
+    """
+    Replaces the ladder sprites with grey chain sprites.
+    Chains are drawn as a 4-pixel wide alternating pattern (Inner vs Outer pixels).
+    """
+    NEW_CHAIN_COLOR = (128, 128, 128) # Grey
+
+    # Create the procedural asset (1x1 pixel RGBA sprite)
+    custom_color_rgba = jnp.array([[[
+        NEW_CHAIN_COLOR[0],  # R
+        NEW_CHAIN_COLOR[1],  # G
+        NEW_CHAIN_COLOR[2],  # B
+        255  # Alpha (fully opaque)
+    ]]], dtype=jnp.uint8)
+
+    # Add via asset_overrides
+    asset_overrides = {
+        'custom_chain_color': {
+            'name': 'custom_chain_color',
+            'type': 'procedural',
+            'data': custom_color_rgba
+        }
+    }
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_ladders(self, raster: jnp.ndarray, state):
+        """
+        Draws chains: A 4px wide pattern alternating between inner connectors and outer loops.
+        """
+        # 1. Access Data from the Environment State
+        positions = state.level.ladder_positions
+        sizes = state.level.ladder_sizes
+        
+        # Access the renderer's calculated color ID for the chain
+        chain_color = self._env.renderer.COLOR_TO_ID.get(self.NEW_CHAIN_COLOR, 0)
+            
+        # 2. Get dimensions
+        h, w = raster.shape
+        
+        # 3. Create the meshgrid for vectorization
+        yy, xx = jnp.mgrid[:h, :w]
+
+        # 4. Define Visual Constants
+        chain_visual_width = 4
+        half_width = 2
+        segment_height = 2  # Height of one link segment
+
+        def _create_single_chain_mask(pos, size):
+            """Generates a boolean mask for a single chain."""
+            # Only draw if the ladder exists (x != -1)
+            is_active = pos[0] != -1
+            
+            # Geometry
+            x, y = pos
+            hitbox_width, height = size
+
+            y -= 8
+            height += 12
+            
+            # Calculate Center
+            center_x = x + (hitbox_width // 2)
+            
+            # Start drawing x (shift left by 2 to center the 4px chain)
+            draw_x_start = center_x - half_width
+            
+            # --- Bounding Box Logic ---
+            dx = xx - draw_x_start
+            dy = yy - y
+            
+            # Check if pixel is within the 4px wide x height bounding box
+            in_box = (dx >= 0) & (dx < chain_visual_width) & \
+                     (dy >= 0) & (dy < height)
+            
+            # --- Chain Pattern Logic ---
+            segment_idx = dy // segment_height
+            
+            # Logic:
+            # Inner pixels (dx=1, dx=2) represent the vertical connector
+            # Outer pixels (dx=0, dx=3) represent the sides of the link loop
+            is_inner_pixel = (dx == 1) | (dx == 2)
+            is_outer_pixel = (dx == 0) | (dx == 3)
+            
+            # Alternating Pattern:
+            # Even segments (0, 2...) -> Draw Inner (Connector)
+            # Odd segments  (1, 3...) -> Draw Outer (Loop Sides)
+            segment_is_even = (segment_idx % 2) == 0
+            
+            is_chain_pixel = (segment_is_even & is_inner_pixel) | \
+                             (~segment_is_even & is_outer_pixel)
+            
+            # Combine
+            return in_box & is_chain_pixel & is_active
+
+        # 5. Vectorize
+        all_masks = jax.vmap(_create_single_chain_mask)(positions, sizes)
+        
+        # 6. Collapse
+        combined_mask = jnp.any(all_masks, axis=0)
+        
+        # 7. Apply to Raster
+        return jnp.where(combined_mask, jnp.asarray(chain_color, dtype=raster.dtype), raster)
+
+
+class ReplaceLadderWithRopeMod(JaxAtariInternalModPlugin):
+    """
+    Replaces the ladder sprites with rope sprites.
+    Ropes are drawn as a 2-pixel wide zig-zag pattern centered on the original ladder position.
+    """
+    NEW_LADDER_COLOR = (149, 75, 49)
+
+    # Create the procedural asset (1x1 pixel RGBA sprite)
+    custom_color_rgba = jnp.array([[[
+        NEW_LADDER_COLOR[0],  # R
+        NEW_LADDER_COLOR[1],  # G
+        NEW_LADDER_COLOR[2],  # B
+        255  # Alpha (fully opaque)
+    ]]], dtype=jnp.uint8)
+
+    # Add via asset_overrides (can add new assets, not just override existing ones!)
+    asset_overrides = {
+        'custom_ladder_color': {
+            'name': 'custom_ladder_color',
+            'type': 'procedural',
+            'data': custom_color_rgba
+        }, 
+        "kangaroo": {
+            'name': 'kangaroo', 
+            'type': 'group',
+            'files': ['kangaroo.npy', 'kangaroo_dead.npy', 'kangaroo_rope_climb.npy', 'kangaroo_ducking.npy', 'kangaroo_jump.npy', 'kangaroo_boxing.npy', 'kangaroo_walk.npy', 'kangaroo_jump_high.npy']
+        }
+    }
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _draw_ladders(self, raster: jnp.ndarray, state: KangarooState):
+        """
+        Draws ropes: a 2-pixel wide zig-zag pattern.
+        """
+        # 1. Access Data from the Environment State
+        positions = state.level.ladder_positions
+        sizes = state.level.ladder_sizes
+        
+        # Access the renderer's calculated color ID for the ladder/rope
+        rope_color = self._env.renderer.COLOR_TO_ID.get(self.NEW_LADDER_COLOR, 0)
+            
+        # 2. Get dimensions
+        h, w = raster.shape
+        
+        # 3. Create the meshgrid for vectorization
+        # yy corresponds to row indices, xx to column indices
+        yy, xx = jnp.mgrid[:h, :w]
+
+        # 4. Define Visual Constants
+        rope_visual_width = 2 
+        segment_height = 4  # How many pixels tall one 'twist' of the rope is
+
+        def _create_single_rope_mask(pos, size):
+            """Generates a boolean mask for a single rope."""
+            # Only draw if the ladder exists (x != -1)
+            is_active = pos[0] != -1
+            
+            # Geometry
+            x, y = pos
+            hitbox_width, height = size
+
+            y -= 8
+            height += 8
+            
+            # Calculate Center: The rope hangs in the middle of the ladder hitbox
+            center_x = x + (hitbox_width // 2)
+            
+            # Start drawing x (shift left by 1 to center the 2px rope)
+            draw_x_start = center_x - 1
+            
+            # --- Bounding Box Logic ---
+            # Determine relative coordinates to the top-left of the rope
+            dx = xx - draw_x_start
+            dy = yy - y
+            
+            # Check if pixel is within the 2px wide x height bounding box
+            in_box = (dx >= 0) & (dx < rope_visual_width) & \
+                     (dy >= 0) & (dy < height)
+            
+            # --- Zig-Zag Pattern Logic ---
+            # We determine the 'segment' index based on Y position.
+            # Example: Rows 0-1 are segment 0, Rows 2-3 are segment 1.
+            segment_idx = dy // segment_height
+            
+            # Check if the pixel is on the left side (dx=0) or right side (dx=1)
+            is_left_pixel = (dx == 0)
+            
+            # Pattern: 
+            # Even segments (0, 2, 4...) -> Draw Left Pixel
+            # Odd segments (1, 3, 5...)  -> Draw Right Pixel
+            segment_is_even = (segment_idx % 2) == 0
+            
+            # Draw if (Even Segment AND Left Pixel) OR (Odd Segment AND Right Pixel)
+            # This is equivalent to checking if the boolean values are equal
+            is_rope_pixel = (segment_is_even == is_left_pixel)
+            
+            # Combine: Must be in bounding box, match the pattern, and be active
+            return in_box & is_rope_pixel & is_active
+
+        # 5. Vectorize: Apply logic to all ladders simultaneously
+        # resulting shape: (Num_Ladders, Height, Width)
+        all_masks = jax.vmap(_create_single_rope_mask)(positions, sizes)
+        
+        # 6. Collapse: Combine all ladder masks into one single layer
+        combined_mask = jnp.any(all_masks, axis=0)
+        
+        # 7. Apply to Raster: Where mask is True, paint the rope color
+        return jnp.where(combined_mask, jnp.asarray(rope_color, dtype=raster.dtype), raster)
+
+
+        # Vectorize over all ropes in the array
+        all_masks = jax.vmap(_create_single_rope_mask)(pos_scaled, size_scaled)
+        
+        # Combine all rope masks into one layer
+        combined_mask = jnp.logical_or.reduce(all_masks, axis=0)
+        
+        # Apply to raster
+        return jnp.where(combined_mask, jnp.asarray(self.LADDER_COLOR_ID, raster.dtype), raster)
+
 
 # --- MOD B: Make the "Flame" (Bell) Lethal ---
 
