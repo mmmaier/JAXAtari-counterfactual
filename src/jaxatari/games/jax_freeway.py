@@ -9,14 +9,37 @@ from typing import Tuple, NamedTuple, List, Dict, Optional, Any
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 import jaxatari.spaces as spaces
 from jaxatari.renderers import JAXGameRenderer
-import jaxatari.rendering.jax_rendering_utils as jr
+from jaxatari.rendering import jax_rendering_utils as render_utils
+
+def get_default_asset_config() -> tuple:
+    """Returns the declarative manifest of all assets for the game."""
+    asset_config = [
+        {'name': 'background', 'type': 'background', 'file': 'background.npy'},
+        {
+            'name': 'player', 'type': 'group',
+            'files': ['player_hit.npy', 'player_walk.npy', 'player_idle.npy']
+        },
+        {'name': 'car_dark_red', 'type': 'single', 'file': 'car_dark_red.npy'},
+        {'name': 'car_light_green', 'type': 'single', 'file': 'car_light_green.npy'},
+        {'name': 'car_dark_green', 'type': 'single', 'file': 'car_dark_green.npy'},
+        {'name': 'car_light_red', 'type': 'single', 'file': 'car_light_red.npy'},
+        {'name': 'car_blue', 'type': 'single', 'file': 'car_blue.npy'},
+        {'name': 'car_brown', 'type': 'single', 'file': 'car_brown.npy'},
+        {'name': 'car_light_blue', 'type': 'single', 'file': 'car_light_blue.npy'},
+        {'name': 'car_red', 'type': 'single', 'file': 'car_red.npy'},
+        {'name': 'car_green', 'type': 'single', 'file': 'car_green.npy'},
+        {'name': 'car_yellow', 'type': 'single', 'file': 'car_yellow.npy'},
+        {'name': 'score_digits', 'type': 'digits', 'pattern': 'score_{}.npy'},
+    ]
+    return tuple(asset_config)
+
 
 class FreewayConstants(NamedTuple):
     screen_width: int = 160
     screen_height: int = 210
     chicken_width: int = 6
     chicken_height: int = 8
-    chicken_x: int = 40  # Fixed x position
+    chicken_x: int = 44  # Fixed x position
     car_width: int = 8
     car_height: int = 10
     num_lanes: int = 10
@@ -26,19 +49,56 @@ class FreewayConstants(NamedTuple):
     top_border: int = 15
     top_path: int = 8
     bottom_border: int = 180
-    # Upper 5 lanes move left (-), lower 5 lanes move right (+)
-    # Value at i is the frequency in which car at lane i moves one pixel
-    car_update = [
+    # Collision response tuning
+    throw_back_frames: int = 24  # frames the chicken is pushed back after hit
+    stun_frames: int = 28        # frames the chicken cannot move after hit
+    # After scoring (reaching the top and resetting), prevent movement for N frames
+    post_score_stun_frames: int = 28
+    # Vertical offset to apply to chicken spawn after scoring (positive = lower on screen)
+    post_score_spawn_offset_y: int = 1
+    # Collision box insets (shrink AABB without changing render sizes)
+    chicken_hit_inset_x: int = 1
+    chicken_hit_inset_y_top: int = -2    # Top edge of chicken (when cars approach from above)
+    chicken_hit_inset_y_bottom: int = 0 # Bottom edge of chicken (when cars approach from below)
+    car_hit_inset_x: int = 0
+    car_hit_inset_y_top: int = 2        # Top edge of car (for cars approaching from above)
+    car_hit_inset_y_bottom: int = 0     # Bottom edge of car (for cars approaching from below)
+    # Fine-tune horizontal respawn offset applied when wrapping
+    # Positive shifts right-moving lanes further right on re-entry (and vice versa for left-moving)
+    respawn_offset: int = 8
+    # Fine-tune vertical car alignment within each lane (applied at reset)
+    car_y_offset: int = 1
+    # Per-lane cadence phase offset (frames) for N-frame movement; allows aligning cadence to reference
+    cadence_phase_offset: List[int] = (
+        -2, -2, -2, 0, 0,
+        0, 0, -2, -2, 3
+    )
+    # This list defines the period and direction for each lane's pattern
+    CAR_UPDATES: List[int] = [
         -5,  # Lane 0
         -4,  # Lane 1
         -3,  # Lane 2
         -2,  # Lane 3
         -1,  # Lane 4
-        1,  # Lane 5
-        2,  # Lane 6
-        3,  # Lane 7
-        4,  # Lane 8
-        5,  # Lane 9
+        1,   # Lane 5
+        2,   # Lane 6
+        3,   # Lane 7
+        4,   # Lane 8
+        5,   # Lane 9
+    ]
+    # Per-lane initial phase offsets in pixels to align with ALE (applied to x at reset)
+    # Lanes 0-4 move left; lanes 5-9 move right
+    lane_phase_offset: List[int] = [
+        5,  # lane 0 (+5 px)
+        5,  # lane 1
+        5,  # lane 2
+        5,  # lane 3
+        6,  # lane 4
+        156, # lane 5 (+157 px)
+        157, # lane 6
+        157, # lane 7
+        157, # lane 8
+        157, # lane 9
     ]
     # Upper 5 lanes move left (-), lower 5 lanes move right (+)
     # Value at i is the frequency in which car at lane i moves one pixel
@@ -57,17 +117,37 @@ class FreewayConstants(NamedTuple):
         + (top_border + top_path)
         + 2,  # Lane 10
     ]
+    # Car colors for each lane (10 lanes). If color is None, use original sprite color.
+    # Otherwise, recolor the car sprite to the specified RGB color.
+    # Note: Use None for original color, (0, 0, 0) for actual black.
+    CAR_COLORS: List[Optional[Tuple[int, int, int]]] = [
+        None,  # Lane 0 - use original color
+        None,  # Lane 1 - use original color
+        None,  # Lane 2 - use original color
+        None,  # Lane 3 - use original color
+        None,  # Lane 4 - use original color
+        None,  # Lane 5 - use original color
+        None,  # Lane 6 - use original color
+        None,  # Lane 7 - use original color
+        None,  # Lane 8 - use original color
+        None,  # Lane 9 - use original color
+    ]
+    # sprites to enable asset overrides
+    ASSET_CONFIG: tuple = get_default_asset_config()
 
 
 class FreewayState(NamedTuple):
     """Represents the current state of the game"""
 
     chicken_y: chex.Array
-    cars: chex.Array  # Shape: (num_lanes, 2) for x,y positions
+    cars: chex.Array  # Shape: (num_lanes, 2) for x,y positions (ints for render/collide)
+    # Per-lane cadence counters (frames), advance independently to sync movement patterns per lane
+    lane_time: chex.Array
     score: chex.Array
     time: chex.Array
     cooldown: chex.Array  # Cooldown after collision
     walking_frames: chex.Array
+    lives_lost: chex.Array
     game_over: chex.Array
 
 
@@ -80,13 +160,11 @@ class EntityPosition(NamedTuple):
 
 class FreewayObservation(NamedTuple):
     chicken: EntityPosition
-    car: EntityPosition
-    score: jnp.ndarray
+    car: jnp.ndarray  # Shape: (10, 4) with x,y,width,height for each car
 
 
 class FreewayInfo(NamedTuple):
     time: jnp.ndarray
-    all_rewards: jnp.ndarray
 
 
 class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, FreewayConstants]):
@@ -98,7 +176,7 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             reward_funcs = tuple(reward_funcs)
         self.reward_funcs = reward_funcs
         self.state = self.reset()
-        self.renderer = FreewayRenderer()
+        self.renderer = FreewayRenderer(self.consts)
 
     def reset(self, key: jax.random.PRNGKey = None) -> Tuple[FreewayObservation, FreewayState]:
         """Initialize a new game state"""
@@ -111,7 +189,7 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
                 self.consts.lane_borders[lane]
                 + int(self.consts.lane_spacing / 2)
                 - int(self.consts.car_height / 2)
-            )
+            ) + int(self.consts.car_y_offset)
             # Upper 5 lanes start from right, lower 5 lanes start from left
             if lane < 5:
                 x = (
@@ -121,13 +199,24 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
                 x = 0  # Start from left
             cars.append([x, lane_y])
 
+        cars = jnp.array(cars, dtype=jnp.int32)
+        # Apply per-lane phase offsets
+        phase = jnp.array(self.consts.lane_phase_offset, dtype=jnp.int32)
+        cars = cars.at[:, 0].add(phase)
+
+        # Initialize per-lane cadence counters using configured phase offsets
+        periods0 = jnp.abs(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
+        phases0 = jnp.array(self.consts.cadence_phase_offset, dtype=jnp.int32) % periods0
+
         state = FreewayState(
             chicken_y=jnp.array(chicken_y, dtype=jnp.int32),
-            cars=jnp.array(cars, dtype=jnp.int32),
+            cars=cars,
+            lane_time=phases0,
             score=jnp.array(0, dtype=jnp.int32),
             time=jnp.array(0, dtype=jnp.int32),
             cooldown=jnp.array(0, dtype=jnp.int32),
             walking_frames=jnp.array(0, dtype=jnp.int32),
+            lives_lost=jnp.array(0, dtype=jnp.int32),
             game_over=jnp.array(False, dtype=jnp.bool_),
         )
 
@@ -138,13 +227,16 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
         """Take a step in the game given an action"""
         # Update chicken position if not in cooldown
         dy = jnp.where(
-            jnp.logical_and(state.cooldown > 30, state.cooldown < 54), # throw the chicken back for 24 frames
+            jnp.logical_and(
+                state.cooldown > self.consts.stun_frames,
+                state.cooldown <= (self.consts.stun_frames + self.consts.throw_back_frames)
+            ),
             1.0,
             jnp.where(action == Action.UP, -1.0, jnp.where(action == Action.DOWN, 1.0, 0.0)),
         )
 
         dy = jnp.where(
-            jnp.logical_and(state.cooldown > 0, state.cooldown < 30), # stun the chicken for 30 frames
+            jnp.logical_and(state.cooldown > 0, state.cooldown <= self.consts.stun_frames),
             0.0,
             dy,
         )
@@ -161,45 +253,62 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             self.consts.bottom_border + self.consts.chicken_height - 1,
         ).astype(jnp.int32)
 
-        # Update car positions
-        new_cars = state.cars
-        for lane in range(self.consts.num_lanes):
-            # Update x position based on lane speed
-            dir = (
-                self.consts.car_update[lane] / jnp.abs(self.consts.car_update[lane])
-            ).astype(jnp.int32)
-            new_x = jax.lax.cond(
-                jnp.equal(jnp.mod(state.time, self.consts.car_update[lane]), 0),
-                lambda: state.cars[lane, 0] + dir,
-                lambda: state.cars[lane, 0],
-            )
+        # Implements the [0, 0, ..., 1] repeating pattern based on CAR_UPDATES
+        periods = jnp.abs(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
+        signs = jnp.sign(jnp.array(self.consts.CAR_UPDATES, dtype=jnp.int32))
+        # Per-lane cadence counters: move when the counter reaches period-1, then keep advancing
+        should_move_mask = (state.lane_time == (periods - 1))
+        delta_x = jnp.where(should_move_mask, signs, 0).astype(jnp.int32)
 
-            # Wrap around screen
-            new_x = jnp.where(
-                self.consts.car_update[lane] > 0,
-                jnp.where(
-                    new_x > self.consts.screen_width, -self.consts.car_width, new_x
-                ),
-                jnp.where(
-                    new_x < -self.consts.car_width, self.consts.screen_width, new_x
-                ),
-            ).astype(jnp.int32)
+        # Apply moves to integer x positions
+        pre_x = state.cars[:, 0]
+        x_int = pre_x + delta_x
 
-            new_cars = new_cars.at[lane, 0].set(new_x)
+        # Wrap positions to [-car_width, screen_width)
+        range_len_i = self.consts.screen_width + self.consts.car_width
+        x_int_wrapped = ((x_int + self.consts.car_width) % range_len_i) - self.consts.car_width
+
+        # Apply respawn offset only to entries that wrapped this frame
+        wrapped_right = jnp.logical_and(signs > 0, x_int >= self.consts.screen_width)
+        wrapped_left = jnp.logical_and(signs < 0, x_int < -self.consts.car_width)
+
+        offset = jnp.asarray(self.consts.respawn_offset, dtype=jnp.int32)
+        adjusted = x_int_wrapped
+        adjusted = jnp.where(wrapped_right, x_int_wrapped + offset, adjusted)
+        adjusted = jnp.where(wrapped_left, x_int_wrapped - offset, adjusted)
+        # Keep within valid range after offset
+        adjusted = jnp.clip(adjusted, -self.consts.car_width, self.consts.screen_width - 1)
+
+        # Update integer car positions
+        new_cars = state.cars.at[:, 0].set(adjusted.astype(jnp.int32))
+
+        # Advance per-lane cadence counters
+        new_lane_time = (state.lane_time + 1) % periods
 
         # Check for collisions
         def check_collision(car_pos):
             car_x, car_y = car_pos
-            return jnp.logical_and(
-                self.consts.chicken_x < car_x + self.consts.car_width,
-                jnp.logical_and(
-                    self.consts.chicken_x + self.consts.chicken_width > car_x,
-                    jnp.logical_and(
-                        state.chicken_y - self.consts.chicken_height < car_y,
-                        state.chicken_y > car_y - self.consts.car_height,
-                    ),
-                ),
-            )
+            # Chicken AABB with insets
+            cxi = jnp.asarray(self.consts.chicken_hit_inset_x, dtype=jnp.int32)
+            cyi_top = jnp.asarray(self.consts.chicken_hit_inset_y_top, dtype=jnp.int32)
+            cyi_bottom = jnp.asarray(self.consts.chicken_hit_inset_y_bottom, dtype=jnp.int32)
+            ch_x0 = self.consts.chicken_x + cxi
+            ch_x1 = self.consts.chicken_x + self.consts.chicken_width - cxi
+            ch_y0 = state.chicken_y - self.consts.chicken_height + cyi_top
+            ch_y1 = state.chicken_y - cyi_bottom
+
+            # Car AABB with insets
+            kxi = jnp.asarray(self.consts.car_hit_inset_x, dtype=jnp.int32)
+            kyi_top = jnp.asarray(self.consts.car_hit_inset_y_top, dtype=jnp.int32)
+            kyi_bottom = jnp.asarray(self.consts.car_hit_inset_y_bottom, dtype=jnp.int32)
+            car_x0 = car_x + kxi
+            car_x1 = car_x + self.consts.car_width - kxi
+            car_y0 = car_y - self.consts.car_height + kyi_top
+            car_y1 = car_y - kyi_bottom
+
+            overlap_x = jnp.logical_and(ch_x0 < car_x1, ch_x1 > car_x0)
+            overlap_y = jnp.logical_and(ch_y0 < car_y1, ch_y1 > car_y0)
+            return jnp.logical_and(overlap_x, overlap_y)
 
         # Check collisions for all cars
         collisions = jax.vmap(check_collision)(new_cars)
@@ -211,7 +320,7 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
         # Update cooldown
         new_cooldown = jnp.where(
             any_collision,
-            24 + 30,  # Set cooldown frames after collision (24 frames of flying backwards, 30 frames of being "stunned")
+            self.consts.throw_back_frames + self.consts.stun_frames,
             jnp.maximum(0, state.cooldown - 1),
         ).astype(jnp.int32)
 
@@ -221,11 +330,19 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
         ).astype(jnp.int32)
 
         # Reset chicken position if scored
+        scored = new_y <= self.consts.top_border
         new_y = jnp.where(
-            new_y <= self.consts.top_border,
-            self.consts.bottom_border + self.consts.chicken_height - 1,
+            scored,
+            self.consts.bottom_border + self.consts.chicken_height - 1 + self.consts.post_score_spawn_offset_y,
             new_y,
         ).astype(jnp.int32)
+
+        # Apply a post-score stun to prevent immediate movement after crossing once
+        new_cooldown = jnp.where(
+            scored,
+            jnp.maximum(new_cooldown, jnp.asarray(self.consts.post_score_stun_frames, dtype=jnp.int32)),
+            new_cooldown,
+        )
 
         # Update time
         new_time = (state.time + 1).astype(jnp.int32)
@@ -237,20 +354,27 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
             state.game_over,
         )
 
+        new_live_lost = jnp.where(
+            any_collision,
+            state.lives_lost + 1,
+            state.lives_lost,
+        )
+
         new_state = FreewayState(
             chicken_y=new_y,
             cars=new_cars,
+            lane_time=new_lane_time,
             score=new_score,
             time=new_time,
             cooldown=new_cooldown,
             walking_frames=new_walking_frames.astype(jnp.int32),
+            lives_lost=new_live_lost,
             game_over=game_over,
         )
         done = self._get_done(new_state)
         env_reward = self._get_reward(state, new_state)
-        all_rewards = self._get_all_reward(state, new_state)
         obs = self._get_observation(new_state)
-        info = self._get_info(new_state, all_rewards)
+        info = self._get_info(new_state)
 
         return obs, new_state, env_reward, done, info
 
@@ -279,24 +403,15 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
                     dtype=jnp.int32
                 )
             )
-        return FreewayObservation(chicken=chicken, car=cars, score=state.score)
+        return FreewayObservation(chicken=chicken, car=cars)
 
     @partial(jax.jit, static_argnums=(0,))
-    def _get_info(self, state: FreewayState, all_rewards: chex.Array = None) -> FreewayInfo:
-        return FreewayInfo(time=state.time, all_rewards=all_rewards)
+    def _get_info(self, state: FreewayState) -> FreewayInfo:
+        return FreewayInfo(time=state.time)
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_reward(self, previous_state: FreewayState, state: FreewayState):
         return state.score - previous_state.score
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _get_all_reward(self, previous_state: FreewayState, state: FreewayState):
-        if self.reward_funcs is None:
-            return jnp.zeros(1)
-        rewards = jnp.array(
-            [reward_func(previous_state, state) for reward_func in self.reward_funcs]
-        )
-        return rewards
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: FreewayState) -> bool:
@@ -316,7 +431,6 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
         The observation contains:
         - chicken: EntityPosition (x, y, width, height)
         - car: array of shape (10, 4) with x,y,width,height for each car
-        - score: int (0-99)
         """
         return spaces.Dict({
             "chicken": spaces.Dict({
@@ -325,8 +439,7 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
                 "width": spaces.Box(low=0, high=160, shape=(), dtype=jnp.int32),
                 "height": spaces.Box(low=0, high=210, shape=(), dtype=jnp.int32),
             }),
-            "car": spaces.Box(low=0, high=160, shape=(10, 4), dtype=jnp.int32),
-            "score": spaces.Box(low=0, high=99, shape=(), dtype=jnp.int32),
+            "car": spaces.Box(low=0, high=210, shape=(10, 4), dtype=jnp.int32),
         })
 
     def image_space(self) -> spaces.Box:
@@ -357,213 +470,182 @@ class JaxFreeway(JaxEnvironment[FreewayState, FreewayObservation, FreewayInfo, F
         # Flatten car positions and dimensions
         cars_flat = obs.car.reshape(-1)
         
-        # Flatten score
-        score_flat = obs.score.reshape(-1)
-        
         # Concatenate all components
-        return jnp.concatenate([chicken_flat, cars_flat, score_flat]).astype(jnp.int32)
+        return jnp.concatenate([chicken_flat, cars_flat]).astype(jnp.int32)
 
 
 class FreewayRenderer(JAXGameRenderer):
-
     def __init__(self, consts: FreewayConstants = None):
         super().__init__()
         self.consts = consts or FreewayConstants()
-        self.sprites, self.offsets = self._load_sprites()
+        self.config = render_utils.RendererConfig(
+            game_dimensions=(210, 160),
+            channels=3,
+            #downscale=(84, 84)
+        )
+        self.jr = render_utils.JaxRenderingUtils(self.config)
+        
+        # Load and setup assets using the new pattern
+        # Convert tuple to list so we can append the procedural black_bar
+        asset_config = list(self.consts.ASSET_CONFIG)
+        sprite_path = f"{os.path.dirname(os.path.abspath(__file__))}/sprites/freeway"
+        
+        # Add car colors to palette as 1x1 procedural sprites if they're not None
+        # This ensures the colors are in the palette before we recolor
+        for lane_idx, color in enumerate(self.consts.CAR_COLORS):
+            if color is not None:
+                # Create a 1x1 procedural sprite with this color to ensure it's in the palette
+                color_rgba = jnp.array(list(color) + [255], dtype=jnp.uint8).reshape(1, 1, 4)
+                asset_config.append({
+                    'name': f'car_color_lane_{lane_idx}',
+                    'type': 'procedural',
+                    'data': color_rgba
+                })
+        
+        # Create black bar sprite at initialization time
+        black_bar_sprite = self._create_black_bar_sprite()
+        
+        # Add black bar sprite to the asset config as procedural asset
+        asset_config.append({
+            'name': 'black_bar', 
+            'type': 'procedural', 
+            'data': black_bar_sprite
+        })
+        
+        (
+            self.PALETTE,
+            self.SHAPE_MASKS,
+            self.BACKGROUND,
+            self.COLOR_TO_ID,
+            self.FLIP_OFFSETS
+        ) = self.jr.load_and_setup_assets(asset_config, sprite_path)
+        
+        # Recolor cars if specified in constants
+        self._recolor_cars(sprite_path)
 
-    def _load_sprites(self):
-        """Load all sprites required for Freeway rendering."""
-        MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-        sprite_path = os.path.join(MODULE_DIR, "sprites/freeway/")
-
-        sprites: Dict[str, Any] = {}
-        offsets: Dict[str, Any] = {}
-
-        def _load_sprite_frame(name: str) -> Optional[chex.Array]:
-            path = os.path.join(sprite_path, f'{name}.npy')
-            frame = jr.loadFrame(path)
-            return frame.astype(jnp.uint8)
-
-        sprite_names = [
-            'background',
-            'player_hit', 'player_walk', 'player_idle',
-            'car_dark_red', 'car_light_green', 'car_dark_green', 'car_light_red', 'car_blue', 'car_brown',
-            'car_light_blue', 'car_red', 'car_green', 'car_yellow',
+    def _recolor_3d_sprite(self, sprite_array: jnp.ndarray, new_rgb_color: jnp.ndarray) -> jnp.ndarray:
+        """
+        Recolors the non-transparent pixels of a 3D RGBA sprite array.
+        
+        Args:
+            sprite_array: The input array with shape (H, W, 4).
+            new_rgb_color: A 3-element array for the new RGB color.
+            
+        Returns:
+            A new array with the sprite recolored.
+        """
+        # Create a mask from the alpha channel (the 4th channel)
+        is_visible = sprite_array[:, :, 3] > 0
+        
+        # Use the mask to set the RGB values (:3) of visible pixels
+        recolored_array = sprite_array.at[is_visible, :3].set(new_rgb_color)
+        
+        return recolored_array
+    
+    def _recolor_cars(self, sprite_path: str):
+        """
+        Recolors car sprites based on CAR_COLORS in constants.
+        If color is [0,0,0], the original sprite is kept.
+        """
+        # Map lane index to car sprite name
+        car_sprite_names = [
+            'car_dark_red',      # Lane 0
+            'car_light_green',   # Lane 1
+            'car_dark_green',    # Lane 2
+            'car_light_red',     # Lane 3
+            'car_blue',          # Lane 4
+            'car_brown',         # Lane 5
+            'car_light_blue',    # Lane 6
+            'car_red',           # Lane 7
+            'car_green',         # Lane 8
+            'car_yellow',        # Lane 9
         ]
+        
+        for lane_idx in range(self.consts.num_lanes):
+            color = self.consts.CAR_COLORS[lane_idx]
+            # If color is None, skip recoloring (use original)
+            if color is None:
+                continue
+                
+            sprite_name = car_sprite_names[lane_idx]
+            
+            # Load the original sprite
+            sprite_file = os.path.join(sprite_path, f'{sprite_name}.npy')
+            original_sprite = self.jr.loadFrame(sprite_file)
+            
+            # Recolor the sprite
+            new_color = jnp.array(color, dtype=jnp.uint8)
+            recolored_sprite = self._recolor_3d_sprite(original_sprite, new_color)
+            
+            # Create a new mask from the recolored sprite
+            # The color should already be in the palette from the procedural sprite we added
+            new_mask = self.jr._create_id_mask(recolored_sprite, self.COLOR_TO_ID)
+            self.SHAPE_MASKS[sprite_name] = new_mask
 
-        for name in sprite_names:
-            loaded_sprite = _load_sprite_frame(name)
-            if loaded_sprite is not None:
-                sprites[name] = loaded_sprite
-
-        # pad the player sprites since they are used interchangably
-        player_sprites, player_offsets = jr.pad_to_match([
-            sprites['player_hit'], sprites['player_walk'], sprites['player_idle']
-        ])
-        sprites['player_hit'] = player_sprites[0]
-        sprites['player_walk'] = player_sprites[1]
-        sprites['player_idle'] = player_sprites[2]
-        offsets['player_hit'] = player_offsets[0]
-        offsets['player_walk'] = player_offsets[1]
-        offsets['player_idle'] = player_offsets[2]
-
-        # --- Load Digit Sprites ---
-        score_digit_path = os.path.join(sprite_path, 'score_{}.npy')
-        digits = jr.load_and_pad_digits(score_digit_path, num_chars=10)
-        sprites['score'] = digits
-
-        for key in sprites.keys():
-            if isinstance(sprites[key], (list, tuple)):
-                sprites[key] = [jnp.expand_dims(sprite, axis=0) for sprite in sprites[key]]
-            else:
-                sprites[key] = jnp.expand_dims(sprites[key], axis=0)
-
-        return sprites, offsets
+    def _create_black_bar_sprite(self) -> jnp.ndarray:
+        """Create a black bar sprite for the left side of the screen."""
+        # Create an 8-pixel wide black bar covering the full height
+        bar_height = self.consts.screen_height
+        bar_width = 8
+        # Create black sprite with full alpha (255) so it gets added to palette
+        black_bar = jnp.zeros((bar_height, bar_width, 4), dtype=jnp.uint8)
+        black_bar = black_bar.at[:, :, 3].set(255)  # Set alpha to 255
+        return black_bar
 
     @partial(jax.jit, static_argnums=(0,))
     def render(self, state):
-        """Render the game state to a raster image."""
-        raster = jr.create_initial_frame(width=160, height=210)
+        raster = self.jr.create_object_raster(self.BACKGROUND)
 
-        # draw the background
-        background = jr.get_sprite_frame(self.sprites['background'], 0)
+        # Draw fixed chicken at x=110
+        chicken_idle_mask = self.SHAPE_MASKS["player"][2]  # player_idle is index 2
+        raster = self.jr.render_at(raster, 110, self.consts.bottom_border + self.consts.chicken_height - 1, chicken_idle_mask)
 
-        raster = jr.render_at(raster,0, 0, background)
-
-        # draw fixed 2nd chicken at x=110 and y=self.consts.bottom_border + self.consts.chicken_height - 1
-        chicken_idle = jr.get_sprite_frame(self.sprites['player_idle'], 0)
-        chicken_walk = jr.get_sprite_frame(self.sprites['player_walk'], 0)
-        chicken_hit = jr.get_sprite_frame(self.sprites['player_hit'], 0)
-        chicken_idle_offset = self.offsets['player_idle']
-        chicken_walk_offset = self.offsets['player_walk']
-        chicken_hit_offset = self.offsets['player_hit']
-        raster = jr.render_at(raster, 110, self.consts.bottom_border + self.consts.chicken_height - 1, chicken_idle, flip_offset=chicken_idle_offset)
-
-        # select a frame based on the walking frames (0-3 for walk, 4-7 for idle, repeat)
+        # Select chicken sprite based on walking frames and hit state
         use_idle = state.walking_frames < 4
-        chicken = jax.lax.cond(
-            use_idle,
-            lambda: chicken_idle,
-            lambda: chicken_walk,
-        )
-        chicken_offset = jax.lax.cond(
-            use_idle,
-            lambda: chicken_idle_offset,
-            lambda: chicken_walk_offset,
-        )
+        chicken_frame_index = jax.lax.select(use_idle, 2, 1)  # 2=idle, 1=walk
+        
         is_hit = state.cooldown > 0
-        chicken = jax.lax.cond(
+        chicken_frame_index = jax.lax.select(
             jnp.logical_and(is_hit, jnp.logical_or((state.cooldown % 8) < 4, state.cooldown < 30)),
-            lambda: chicken_hit,
-            lambda: chicken
+            0,  # player_hit is index 0
+            chicken_frame_index
         )
-        chicken_offset = jax.lax.cond(
-            is_hit,
-            lambda: chicken_hit_offset,
-            lambda: chicken_offset,
-        )
-        raster = jr.render_at(raster, self.consts.chicken_x, state.chicken_y, chicken, flip_offset=chicken_offset)
+        
+        chicken_mask = self.SHAPE_MASKS["player"][chicken_frame_index]
+        raster = self.jr.render_at(raster, self.consts.chicken_x, state.chicken_y, chicken_mask)
 
-        # render the cars in the correct color (starting from the top: dark red, light green, dark green, light red, blue, brown, light blue, red, green, yellow)
-        dark_red = jr.get_sprite_frame(self.sprites['car_dark_red'], 0)
-        raster = jr.render_at(raster, state.cars[0, 0], state.cars[0, 1], dark_red)
+        # Render cars in the correct colors
+        car_masks = [
+            self.SHAPE_MASKS["car_dark_red"],
+            self.SHAPE_MASKS["car_light_green"],
+            self.SHAPE_MASKS["car_dark_green"],
+            self.SHAPE_MASKS["car_light_red"],
+            self.SHAPE_MASKS["car_blue"],
+            self.SHAPE_MASKS["car_brown"],
+            self.SHAPE_MASKS["car_light_blue"],
+            self.SHAPE_MASKS["car_red"],
+            self.SHAPE_MASKS["car_green"],
+            self.SHAPE_MASKS["car_yellow"],
+        ]
+        
+        for i in range(self.consts.num_lanes):
+            raster = self.jr.render_at_clipped(raster, state.cars[i, 0], state.cars[i, 1], car_masks[i])
 
-        light_green = jr.get_sprite_frame(self.sprites['car_light_green'], 0)
-        raster = jr.render_at(raster, state.cars[1, 0], state.cars[1, 1], light_green)
+        # Render score
+        score_digits = self.jr.int_to_digits(state.score, max_digits=2)
+        score_digit_masks = self.SHAPE_MASKS["score_digits"]
+        
+        is_single_digit = state.score < 10
+        start_index = jax.lax.select(is_single_digit, 1, 0)
+        num_to_render = jax.lax.select(is_single_digit, 1, 2)
+        render_x = jax.lax.select(is_single_digit, 49 + 8 // 2, 49)
+        raster = self.jr.render_label_selective(raster, render_x, 5, score_digits, score_digit_masks, start_index, num_to_render, spacing=8)
+        
+        enemy_score = self.jr.int_to_digits(0, max_digits=1)
+        raster = self.jr.render_label_selective(raster, 113, 5, enemy_score, score_digit_masks, 0, 1, spacing=8)
+        
+        # Render black bar on the left side
+        black_bar_mask = self.SHAPE_MASKS["black_bar"]
+        raster = self.jr.render_at(raster, 0, 0, black_bar_mask)
 
-        dark_green = jr.get_sprite_frame(self.sprites['car_dark_green'], 0)
-        raster = jr.render_at(raster, state.cars[2, 0], state.cars[2, 1], dark_green)
-
-        light_red = jr.get_sprite_frame(self.sprites['car_light_red'], 0)
-        raster = jr.render_at(raster, state.cars[3, 0], state.cars[3, 1], light_red)
-
-        blue = jr.get_sprite_frame(self.sprites['car_blue'], 0)
-        raster = jr.render_at(raster, state.cars[4, 0], state.cars[4, 1], blue)
-
-        brown = jr.get_sprite_frame(self.sprites['car_brown'], 0)
-        raster = jr.render_at(raster, state.cars[5, 0], state.cars[5, 1], brown)
-
-        light_blue = jr.get_sprite_frame(self.sprites['car_light_blue'], 0)
-        raster = jr.render_at(raster, state.cars[6, 0], state.cars[6, 1], light_blue)
-
-        red = jr.get_sprite_frame(self.sprites['car_red'], 0)
-        raster = jr.render_at(raster, state.cars[7, 0], state.cars[7, 1], red)
-
-        green = jr.get_sprite_frame(self.sprites['car_green'], 0)
-        raster = jr.render_at(raster, state.cars[8, 0], state.cars[8, 1], green)
-
-        yellow = jr.get_sprite_frame(self.sprites['car_yellow'], 0)
-        raster = jr.render_at(raster, state.cars[9, 0], state.cars[9, 1], yellow)
-
-        # ----------- SCORE -------------
-        # Define score positions and spacing
-        player_score_rightmost_digit_x = 49  # X position for the START of the player's rightmost digit (or single digit)
-        enemy_score_rightmost_digit_x = 114  # X position for the START of the enemy's single '0' digit
-        score_y = 5
-        score_spacing = 8  # Spacing between digits (should match digit width ideally)
-        max_score_digits = 2
-
-        # Get digit sprites
-        digit_sprites = self.sprites.get('score', None)
-
-        # Define the function to render scores if sprites are available
-        def render_scores(raster_to_update):
-            # --- Player Score (Left) ---
-            # Convert score to digit indices (always 2, e.g., 0 -> [0,0], 10 -> [1,0])
-            player_score_digits_indices = jr.int_to_digits(state.score, max_digits=max_score_digits)
-
-            # Determine parameters based on score magnitude
-            is_player_single_digit = state.score < 10
-
-            # Start index in player_score_digits_indices:
-            # - If single digit (e.g., score=5 -> indices=[0,5]), start reading at index 1 to get the '5'.
-            # - If double digit (e.g., score=12 -> indices=[1,2]), start reading at index 0 to get '1' then '2'.
-            player_start_index = jax.lax.select(is_player_single_digit, 1, 0)
-
-            # Number of digits to render: 1 for single, 2 for double
-            player_num_to_render = jax.lax.select(is_player_single_digit, 1, 2)
-
-            # Calculate the starting X position for rendering:
-            # - If single digit, render starts at player_score_rightmost_digit_x.
-            # - If double digit, render starts score_spacing pixels *before* player_score_rightmost_digit_x,
-            #   so the second digit ('0' in '10') aligns correctly at player_score_rightmost_digit_x.
-            player_render_x = jax.lax.select(is_player_single_digit,
-                                             player_score_rightmost_digit_x,
-                                             player_score_rightmost_digit_x - score_spacing)
-
-            # Render player score using selective rendering
-            raster_updated = jr.render_label_selective(raster_to_update, player_render_x, score_y,
-                                                       player_score_digits_indices, digit_sprites[0],
-                                                       player_start_index, player_num_to_render,
-                                                       spacing=score_spacing)
-
-            # --- Enemy Score (Right - rendering a Dummy '0' since the right player is not playable) ---
-            enemy_score = 0
-            enemy_score_digits_indices = jr.int_to_digits(enemy_score, max_digits=max_score_digits)  # [0, 0]
-            # Parameters for single digit '0'
-            enemy_start_index = 1  # Read the second '0' from indices [0, 0]
-            enemy_num_to_render = 1  # Render only one digit
-            # Render the enemy '0' starting at its designated rightmost position
-            enemy_render_x = enemy_score_rightmost_digit_x
-
-            # Render enemy score using selective rendering
-            raster_final = jr.render_label_selective(raster_updated, enemy_render_x, score_y,
-                                                     enemy_score_digits_indices, digit_sprites[0],
-                                                     enemy_start_index, enemy_num_to_render,
-                                                     spacing=score_spacing)  # Spacing doesn't matter here
-            return raster_final
-
-        # Render scores conditionally
-        raster = jax.lax.cond(
-            digit_sprites is not None,
-            render_scores,
-            lambda r: r,
-            raster
-        )
-
-        # Force the first 8 columns (x=0 to x=7) to be black (KEEP THIS PART)
-        # Frame is (Height, Width, Channels) so we index as [y_range, x_range, :]
-        bar_width = 8
-        raster = raster.at[:, :bar_width, :].set(0)
-
-        return raster
+        return self.jr.render_from_palette(raster, self.PALETTE)

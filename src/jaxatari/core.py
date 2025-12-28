@@ -2,6 +2,10 @@ import importlib
 import inspect
 
 from jaxatari.environment import JaxEnvironment
+from jaxatari.renderers import JAXGameRenderer
+from jaxatari.modification import apply_modifications
+from jaxatari.wrappers import JaxatariWrapper
+
 
 
 # Map of game names to their module paths
@@ -14,14 +18,37 @@ GAME_MODULES = {
     # Add new games here
 }
 
+# Mod modules registry: for each game, provide the Controller class path
+MOD_MODULES = {
+    "pong": "jaxatari.games.mods.pong_mods.PongEnvMod",
+    "kangaroo": "jaxatari.games.mods.kangaroo_mods.KangarooEnvMod",
+    "freeway": "jaxatari.games.mods.freeway_mods.FreewayEnvMod",
+    "breakout": "jaxatari.games.mods.breakout_mods.BreakoutEnvMod",
+    "seaquest": "jaxatari.games.mods.seaquest_mods.SeaquestEnvMod",
+}
+
+
 def list_available_games() -> list[str]:
     """Lists all available, registered games."""
     return list(GAME_MODULES.keys())
 
-def make(game_name: str, mode: int = 0, difficulty: int = 0) -> JaxEnvironment:
+
+def make(game_name: str, 
+         mode: int = 0, 
+         difficulty: int = 0,
+         mods_config: list = None,
+         allow_conflicts: bool = False
+         ) -> JaxEnvironment:
     """
     Creates and returns a JaxAtari game environment instance.
     This is the main entry point for creating environments.
+
+    If 'mods_config' is provided, this function applies the
+    full two-stage modding pipeline:
+    1. Pre-scans for constant overrides.
+    2. Instantiates the base env with modded constants.
+    3. Applies the internal 'JaxAtariModController'.
+    4. Wraps the env with the 'JaxAtariModWrapper'.
 
     Args:
         game_name: Name of the game to load (e.g., "pong").
@@ -37,22 +64,66 @@ def make(game_name: str, mode: int = 0, difficulty: int = 0) -> JaxEnvironment:
         )
     
     try:
-        # 1. Dynamically load the module
+        # 1. Load the base environment class
         module = importlib.import_module(GAME_MODULES[game_name])
-        
-        # 2. Find the correct environment class within the module
         env_class = None
         for _, obj in inspect.getmembers(module):
             if inspect.isclass(obj) and issubclass(obj, JaxEnvironment) and obj is not JaxEnvironment:
                 env_class = obj
-                break # Found it
-        
+                break
         if env_class is None:
             raise ImportError(f"No JaxEnvironment subclass found in {GAME_MODULES[game_name]}")
-        
-        # 3. Instantiate the class, passing along the arguments, and return it
-        # TODO: none of our environments use mode / difficulty yet, but we might want to add it here and in the single envs
-        return env_class()
 
-    except (ImportError, AttributeError) as e:
+        # 2. Get default constants
+        base_consts = env_class().consts
+
+        # 3. Handle mods if requested
+        if mods_config:
+            return apply_modifications(
+                game_name=game_name,
+                mods_config=mods_config,
+                allow_conflicts=allow_conflicts,
+                base_consts=base_consts,
+                env_class=env_class,
+                MOD_MODULES=MOD_MODULES
+            )
+
+        # No mods: return default base env with default constants
+        return env_class(consts=base_consts)
+
+    except (ImportError, AttributeError, ValueError, NotImplementedError) as e:
         raise ImportError(f"Failed to load game '{game_name}': {e}") from e
+
+def make_renderer(game_name: str) -> JAXGameRenderer:
+    """
+    Creates and returns a JaxAtari game environment renderer.
+
+    Args:
+        game_name: Name of the game to load (e.g., "pong").
+
+    Returns:
+        An instance of the specified game environment renderer.
+    """
+    if game_name not in GAME_MODULES:
+        raise NotImplementedError(
+            f"The game '{game_name}' does not exist. Available games: {list_available_games()}"
+        )
+    
+    try:
+        # 1. Dynamically load the module
+        module = importlib.import_module(GAME_MODULES[game_name])
+        
+        # 2. Find the correct environment class within the module
+        renderer_class = None
+        for _, obj in inspect.getmembers(module):
+            if inspect.isclass(obj) and issubclass(obj, JAXGameRenderer) and obj is not JAXGameRenderer:
+                renderer_class = obj
+                break # Found it
+
+        if renderer_class is None:
+            raise ImportError(f"No AXGameRenderer subclass found in {GAME_MODULES[game_name]}")
+
+        # 3. Instantiate the class, passing along the arguments, and return it
+        return renderer_class()
+    except (ImportError, AttributeError) as e:
+      raise ImportError(f"Failed to load renderer for '{game_name}': {e}") from e

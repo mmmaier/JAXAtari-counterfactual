@@ -3,13 +3,14 @@ import os
 from typing import NamedTuple, Tuple
 import jax
 import jax.numpy as jnp
+import numpy as np
 import chex
 import pygame
 
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 import jaxatari.spaces as spaces
 from jaxatari.renderers import JAXGameRenderer
-import jaxatari.rendering.jax_rendering_utils as jr
+import jaxatari.rendering.jax_rendering_utils as render_utils
 
 class BreakoutConstants(NamedTuple):
     WINDOW_WIDTH: int = 160
@@ -38,7 +39,8 @@ class BreakoutConstants(NamedTuple):
     BALL_START_X: chex.Array = jnp.array([16, 78, 80, 142])
     BALL_START_Y: int = 122
     PLAYER_X_MIN: int = 8
-    PLAYER_X_MAX: int = 160 - 16
+    # PLAYER_X_MAX is calculated dynamically based on paddle width to support mods
+    # It will be computed as WINDOW_WIDTH - WALL_SIDE_WIDTH - max(PLAYER_SIZE[0], PLAYER_SIZE_SMALL[0])
     PLAYER_MAX_SPEED: int = 6
     PLAYER_ACCELERATION: chex.Array = jnp.array([3, 2, -1, 1, 1])
     PLAYER_WALL_ACCELERATION: chex.Array = jnp.array([1, 2, 1, 1, 1])
@@ -81,7 +83,6 @@ class BreakoutObservation(NamedTuple):
 class BreakoutInfo(NamedTuple):
     time: chex.Array
     wall_resets: chex.Array
-    all_rewards: chex.Array
 
 
 # Game state container
@@ -113,7 +114,13 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         self.renderer = BreakoutRenderer(self.consts)
         if reward_funcs is not None:
             reward_funcs = tuple(reward_funcs) 
-        self.reward_funcs = reward_funcs 
+        self.reward_funcs = reward_funcs
+    
+    def _get_player_x_max(self) -> int:
+        """Calculate the maximum X position for the player paddle.
+        This ensures the paddle doesn't extend beyond the right wall, accounting for variable paddle sizes."""
+        max_paddle_width = max(self.consts.PLAYER_SIZE[0], self.consts.PLAYER_SIZE_SMALL[0])
+        return self.consts.WINDOW_WIDTH - self.consts.WALL_SIDE_WIDTH - max_paddle_width 
 
     def get_human_action(self) -> chex.Array:
         """Records keyboard input and returns the corresponding action."""
@@ -139,9 +146,14 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         left = action == Action.LEFT
         right = action == Action.RIGHT
 
+        # Calculate the maximum X position based on paddle width
+        # Use the maximum paddle width to ensure it works for both normal and small paddles
+        max_paddle_width = max(self.consts.PLAYER_SIZE[0], self.consts.PLAYER_SIZE_SMALL[0])
+        player_x_max = self.consts.WINDOW_WIDTH - self.consts.WALL_SIDE_WIDTH - max_paddle_width
+        
         # Check if the paddle is touching the left or right wall.
         touches_wall = jnp.logical_or(
-            state_player_x <= self.consts.PLAYER_X_MIN, state_player_x >= self.consts.PLAYER_X_MAX
+            state_player_x <= self.consts.PLAYER_X_MIN, state_player_x >= player_x_max
         )
 
         # Get the acceleration schedule based on whether the paddle is at a wall.
@@ -214,7 +226,8 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         )
 
         # Update the paddle's horizontal position and clamp it within the game boundaries.
-        player_x = jnp.clip(state_player_x + player_speed, self.consts.PLAYER_X_MIN, self.consts.PLAYER_X_MAX)
+        # player_x_max was already calculated at the beginning of this function
+        player_x = jnp.clip(state_player_x + player_speed, self.consts.PLAYER_X_MIN, player_x_max)
 
         return player_x, player_speed, new_acceleration_counter
 
@@ -581,7 +594,7 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         )
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(self, key = None) -> tuple[BreakoutObservation, BreakoutState]:
+    def reset(self, key: chex.PRNGKey = None) -> tuple[BreakoutObservation, BreakoutState]:
         """Initialize game state"""
         init_speed_idx = 0
         init_direction_idx = 0
@@ -621,8 +634,7 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         obs = self._get_observation(new_state)
         env_reward = self._get_reward(state, new_state)
         done = self._get_done(new_state)
-        all_rewards = self._get_all_reward(state, new_state)
-        info = self._get_info(new_state, all_rewards)
+        info = self._get_info(new_state)
         return obs, new_state, env_reward, done, info
 
     @partial(jax.jit, static_argnums=(0,))
@@ -726,25 +738,15 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         )
 
     @partial(jax.jit, static_argnums=(0,))
-    def _get_info(self, state: BreakoutState, all_rewards: chex.Array = None) -> BreakoutInfo:
+    def _get_info(self, state: BreakoutState) -> BreakoutInfo:
         return BreakoutInfo(
             time=state.step_counter,
             wall_resets=state.wall_resets,
-            all_rewards=all_rewards
         )
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_reward(self, previous_state: BreakoutState, current_state: BreakoutState) -> chex.Array:
         return current_state.score - previous_state.score
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _get_all_reward(self, previous_state: BreakoutState, state: BreakoutState):
-        if self.reward_funcs is None:
-            return jnp.zeros(1)
-        rewards = jnp.array(
-            [reward_func(previous_state, state) for reward_func in self.reward_funcs]
-        )
-        return rewards
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: BreakoutState) -> chex.Array:
@@ -817,154 +819,269 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             obs.score.flatten(),
             obs.lives.flatten(),
         ])
-    
+
 
 class BreakoutRenderer(JAXGameRenderer):
     def __init__(self, consts: BreakoutConstants = None):
         super().__init__()
         self.consts = consts or BreakoutConstants()
-        self.SPRITE_BG, self.SPRITE_PLAYER, self.SPRITE_BALL, self.DIGIT_SPRITES = self.load_sprites()
-        self.BLOCK_COLORS = [jnp.array(color, dtype=jnp.uint8) for color in self.consts.BLOCK_COLORS]
-
-        self.BLOCK_SIZE = (self.consts.BLOCK_SIZE[0], self.consts.BLOCK_SIZE[1])
-
-        # Pre-compute the raster layers for every possible block position.
-        self.ALL_POSSIBLE_BLOCK_RASTERS = self._precompute_block_rasters()
-
-    def load_sprites(self):
-        """Load all sprites required for Pong rendering."""
-        MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-        # Load sprites
-        player = jr.loadFrame(os.path.join(MODULE_DIR, "sprites/breakout/player.npy"))
-        ball = jr.loadFrame(os.path.join(MODULE_DIR, "sprites/breakout/ball.npy"))
-
-        bg = jr.loadFrame(os.path.join(MODULE_DIR, "sprites/breakout/background.npy"))
-
-        # Convert all sprites to the expected format (add frame dimension)
-        SPRITE_BG = jnp.expand_dims(bg, axis=0)
-        SPRITE_PLAYER = jnp.expand_dims(player, axis=0)
-        SPRITE_BALL = jnp.expand_dims(ball, axis=0)
-
-        # Load digits for scores
-        DIGIT_SPRITES = jr.load_and_pad_digits(
-            os.path.join(MODULE_DIR, "sprites/breakout/score_{}.npy"),
-            num_chars=10,
+        self.config = render_utils.RendererConfig(
+            game_dimensions=(210, 160),
+            channels=3,
+            #downscale=(84, 84)
         )
+        self.jr = render_utils.JaxRenderingUtils(self.config)
 
-        return (
-            SPRITE_BG,
-            SPRITE_PLAYER,
-            SPRITE_BALL,
-            DIGIT_SPRITES
-        )
-    
-    
-    def _precompute_block_rasters(self):
-        """
-        Calculates a stack of rasters, one for each possible block position.
-        This is done once at initialization to speed up the main render loop.
-        """
-        # Helper function to draw a single block on a blank canvas of fixed size.
-        def draw_single_block(x, y, color):
-            # Frame shape should be (Height, Width, Channels) = (210, 160, 3)
-            blank_raster = jr.create_initial_frame(width=160, height=210)
-            patch = jnp.full((self.BLOCK_SIZE[1], self.BLOCK_SIZE[0], 3), color, dtype=jnp.uint8)
-            return jax.lax.dynamic_update_slice(blank_raster, patch, (y, x, 0))
-
-        # Generate coordinates and colors for ALL possible block positions.
-        rows_grid, cols_grid = jnp.meshgrid(
-            jnp.arange(self.consts.NUM_ROWS, dtype=jnp.int32),
-            jnp.arange(self.consts.BLOCKS_PER_ROW, dtype=jnp.int32),
-            indexing='ij'
-        )
-        all_xs = (self.consts.BLOCK_START_X + cols_grid * self.BLOCK_SIZE[0]).flatten()
-        all_ys = (self.consts.BLOCK_START_Y + rows_grid * self.BLOCK_SIZE[1]).flatten()
+        # 1. Standard API setup from the new renderer
+        procedural_sprites = self._create_procedural_sprites()
+        asset_config = self._get_asset_config(procedural_sprites)
+        sprite_path = f"{os.path.dirname(os.path.abspath(__file__))}/sprites/breakout"
         
-        # Convert JAX array to regular Python array for indexing (should be fine since we only call this during init?)
-        rows_flat = rows_grid.flatten()
-        all_colors = jnp.array([self.BLOCK_COLORS[int(row)] for row in rows_flat])
+        # Add ball and player colors to palette as 1x1 procedural sprites if they differ from defaults
+        # This ensures the colors are in the palette before we recolor
+        default_ball_color = (200, 72, 72)
+        default_player_color = (200, 72, 72)
+        
+        if self.consts.BALL_COLOR != default_ball_color:
+            ball_color_rgba = jnp.array(list(self.consts.BALL_COLOR) + [255], dtype=jnp.uint8).reshape(1, 1, 4)
+            asset_config.append({
+                'name': 'ball_color_override',
+                'type': 'procedural',
+                'data': ball_color_rgba
+            })
+        
+        if self.consts.PLAYER_COLOR != default_player_color:
+            player_color_rgba = jnp.array(list(self.consts.PLAYER_COLOR) + [255], dtype=jnp.uint8).reshape(1, 1, 4)
+            asset_config.append({
+                'name': 'player_color_override',
+                'type': 'procedural',
+                'data': player_color_rgba
+            })
+        
+        (
+            self.PALETTE,
+            self.SHAPE_MASKS,
+            self.BACKGROUND,
+            self.COLOR_TO_ID,
+            self.FLIP_OFFSETS
+        ) = self.jr.load_and_setup_assets(asset_config, sprite_path)
 
-        # Vectorize the drawing function over all possible blocks.
-        # This produces a stack of rasters, one for each potential block position.
-        # Shape: (NUM_BLOCKS, WIDTH, HEIGHT, 3)
-        return jax.vmap(draw_single_block, in_axes=(0, 0, 0))(all_xs, all_ys, all_colors)
+        PALETTE_ID_BLACK = 0 # in this case 0 is black which is the background color. In other cases this might need to be adjusted.
+        self.COLOR_MAP = jnp.array([
+            PALETTE_ID_BLACK,
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[0]], # ID 1 -> Red
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[1]], # ID 2 -> Orange
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[2]], # ID 3 -> Yellow
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[3]], # ID 4 -> Green
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[4]], # ID 5 -> Blue
+            self.COLOR_TO_ID[self.consts.BLOCK_COLORS[5]], # ID 6 -> Indigo
+        ])
+        
+        # Recolor ball and player sprites if colors differ from defaults
+        self._recolor_ball_and_player(sprite_path)
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _render_blocks_inverse(self, raster: jnp.ndarray, blocks_state: jnp.ndarray) -> jnp.ndarray:
+        """Renders the block grid using a highly efficient inverse mapping technique."""
+        xx, yy = self.jr._xx, self.jr._yy
 
+        # --- 1. Inverse Mapping Calculation (No changes here) ---
+        start_x = self.consts.BLOCK_START_X * self.jr.config.width_scaling
+        start_y = self.consts.BLOCK_START_Y * self.jr.config.height_scaling
+        block_w = self.consts.BLOCK_SIZE[0] * self.jr.config.width_scaling
+        block_h = self.consts.BLOCK_SIZE[1] * self.jr.config.height_scaling
+
+        col_idx = jnp.floor((xx - start_x) / block_w).astype(jnp.int32)
+        row_idx = jnp.floor((yy - start_y) / block_h).astype(jnp.int32)
+
+        # --- 2. Create Masks and Get Data (Changes are here) ---
+        grid_mask = (row_idx >= 0) & (row_idx < self.consts.NUM_ROWS) & \
+                    (col_idx >= 0) & (col_idx < self.consts.BLOCKS_PER_ROW)
+
+        safe_row = jnp.clip(row_idx, 0, self.consts.NUM_ROWS - 1)
+        safe_col = jnp.clip(col_idx, 0, self.consts.BLOCKS_PER_ROW - 1)
+        active_block_map = blocks_state[safe_row, safe_col]
+
+        # directly use the array of 6 color IDs.
+        color_id_map = self.ALL_BLOCK_COLOR_IDS[safe_row]
+
+        # --- 3. Apply to Raster (No changes here) ---
+        final_block_mask = grid_mask & (active_block_map == 1)
+
+        return jnp.where(final_block_mask, color_id_map, raster)
+
+    def _precompute_block_masks(self):
+        """Pre-computes a stack of monochrome masks, one for each possible block."""
+        def draw_single_mask(x, y):
+            blank_raster = jnp.zeros((210, 160), dtype=jnp.uint8)
+            patch = jnp.ones((self.consts.BLOCK_SIZE[1], self.consts.BLOCK_SIZE[0]), dtype=jnp.uint8)
+            return jax.lax.dynamic_update_slice(blank_raster, patch, (y, x))
+
+        rows, cols = jnp.mgrid[:self.consts.NUM_ROWS, :self.consts.BLOCKS_PER_ROW]
+        all_xs = (self.consts.BLOCK_START_X + cols * self.consts.BLOCK_SIZE[0]).flatten()
+        all_ys = (self.consts.BLOCK_START_Y + rows * self.consts.BLOCK_SIZE[1]).flatten()
+
+        return jax.vmap(draw_single_mask)(all_xs, all_ys)
+
+    def _recolor_3d_sprite(self, sprite_array: jnp.ndarray, new_rgb_color: jnp.ndarray) -> jnp.ndarray:
+        """
+        Recolors the non-transparent pixels of a 3D RGBA sprite array.
+        
+        Args:
+            sprite_array: The input array with shape (H, W, 4).
+            new_rgb_color: A 3-element array for the new RGB color.
+            
+        Returns:
+            A new array with the sprite recolored.
+        """
+        # Create a mask from the alpha channel (the 4th channel)
+        is_visible = sprite_array[:, :, 3] > 0
+        
+        # Use the mask to set the RGB values (:3) of visible pixels
+        recolored_array = sprite_array.at[is_visible, :3].set(new_rgb_color)
+        
+        return recolored_array
+    
+    def _recolor_ball_and_player(self, sprite_path: str):
+        """
+        Recolors ball and player sprites based on BALL_COLOR and PLAYER_COLOR in constants.
+        Note: If player sprite is procedural (due to custom PLAYER_SIZE), it's already created
+        with the correct color, so we skip recoloring it.
+        """
+        default_ball_color = (200, 72, 72)
+        default_player_color = (200, 72, 72)
+        default_player_size = (16, 4)
+        
+        # Recolor ball if color differs from default
+        if self.consts.BALL_COLOR != default_ball_color:
+            # Load the original ball sprite
+            ball_sprite_file = os.path.join(sprite_path, 'ball.npy')
+            original_ball_sprite = self.jr.loadFrame(ball_sprite_file)
+            
+            # Recolor the sprite
+            new_ball_color = jnp.array(self.consts.BALL_COLOR, dtype=jnp.uint8)
+            recolored_ball_sprite = self._recolor_3d_sprite(original_ball_sprite, new_ball_color)
+            
+            # Create a new mask from the recolored sprite
+            new_ball_mask = self.jr._create_id_mask(recolored_ball_sprite, self.COLOR_TO_ID)
+            self.SHAPE_MASKS["ball"] = new_ball_mask
+        
+        # Recolor player if color differs from default AND player size is default
+        # (If player size is custom, the procedural sprite already has the correct color)
+        if self.consts.PLAYER_COLOR != default_player_color and self.consts.PLAYER_SIZE == default_player_size:
+            # Load the original player sprite
+            player_sprite_file = os.path.join(sprite_path, 'player.npy')
+            original_player_sprite = self.jr.loadFrame(player_sprite_file)
+            
+            # Recolor the sprite
+            new_player_color = jnp.array(self.consts.PLAYER_COLOR, dtype=jnp.uint8)
+            recolored_player_sprite = self._recolor_3d_sprite(original_player_sprite, new_player_color)
+            
+            # Create a new mask from the recolored sprite
+            new_player_mask = self.jr._create_id_mask(recolored_player_sprite, self.COLOR_TO_ID)
+            self.SHAPE_MASKS["player"] = new_player_mask
+
+    def _create_procedural_sprites(self) -> dict:
+        """Procedurally creates RGBA sprites for blocks, the bottom bar, and player paddle if size differs from default."""
+        # Create a (6, 1, 1, 4) stack of single-pixel sprites, one for each block color.
+        # This will add the block colors to our palette.
+        block_colors_rgba = jnp.array(self.consts.BLOCK_COLORS, dtype=jnp.uint8)
+        block_pixels = jnp.c_[block_colors_rgba, jnp.full((6, 1), 255, dtype=jnp.uint8)]
+        block_sprites = block_pixels.reshape(6, 1, 1, 4)
+
+        # Create the black bar for the bottom of the screen.
+        bar_w, bar_h = 160, 14
+        bottom_bar_sprite = jnp.zeros((bar_h, bar_w, 4), dtype=jnp.uint8).at[:, :, 3].set(255)
+
+        result = {
+            'block_colors': block_sprites,
+            'bottom_bar': bottom_bar_sprite
+        }
+        
+        # Create procedural player sprite if PLAYER_SIZE differs from default (16, 4)
+        default_player_size = (16, 4)
+        if self.consts.PLAYER_SIZE != default_player_size:
+            player_w, player_h = self.consts.PLAYER_SIZE
+            # Create a solid rectangle sprite with the player color
+            player_sprite = jnp.zeros((player_h, player_w, 4), dtype=jnp.uint8)
+            # Set RGB to player color and alpha to 255 (fully opaque)
+            player_color_rgba = jnp.array(list(self.consts.PLAYER_COLOR) + [255], dtype=jnp.uint8)
+            player_sprite = player_sprite.at[:, :, :].set(player_color_rgba)
+            result['player'] = player_sprite
+
+        return result
+
+    def _get_asset_config(self, procedural_sprites: dict) -> list:
+        """Returns the declarative manifest of all assets for the game."""
+        asset_config = [
+            {'name': 'background', 'type': 'background', 'file': 'background.npy'},
+            {'name': 'ball', 'type': 'single', 'file': 'ball.npy'},
+            {'name': 'score_digits', 'type': 'digits', 'pattern': 'score_{}.npy'},
+            
+            # Add the procedurally created sprites to the manifest
+            {'name': 'block_colors', 'type': 'procedural', 'data': procedural_sprites['block_colors']},
+            {'name': 'bottom_bar', 'type': 'procedural', 'data': procedural_sprites['bottom_bar']},
+        ]
+        
+        # Use procedural player sprite if available (when PLAYER_SIZE differs from default), otherwise use file
+        if 'player' in procedural_sprites:
+            asset_config.append({'name': 'player', 'type': 'procedural', 'data': procedural_sprites['player']})
+        else:
+            asset_config.append({'name': 'player', 'type': 'single', 'file': 'player.npy'})
+        
+        return asset_config
 
     @partial(jax.jit, static_argnums=(0,))
-    def render(self, state):
-        """
-        Renders the current game state using JAX operations.
+    def render(self, state: BreakoutState) -> jnp.ndarray:
+        """Renders the game state using the highly parallel einsum approach."""
+        # --- 1. Initialize Raster & Draw Non-Block Sprites ---
+        # Start with the background palette IDs
+        raster = self.BACKGROUND
 
-        Args:
-            state: A PongState object containing the current game state.
-
-        Returns:
-            A JAX array representing the rendered frame.
-        """
-        # Create empty raster with correct orientation
-        # Frame shape should be (Height, Width, Channels) = (210, 160, 3)
-        raster = jr.create_initial_frame(width=160, height=210)
-
-        # Render background - (0, 0) is top-left corner
-        frame_bg = jr.get_sprite_frame(self.SPRITE_BG, 0)
-        raster = jr.render_at(raster, 0, 0, frame_bg)
-
-        # Render player paddle
-        frame_player = jr.get_sprite_frame(self.SPRITE_PLAYER, 0)
-        raster = jr.render_at(raster, state.player_x, self.consts.PLAYER_START_Y, frame_player)
-
-        # Render ball - ball position is (ball_x, ball_y)
-        # Move ball outside visible area when game hasn't started
+        # 2. Draw player and ball using the standard API
+        raster = self.jr.render_at(raster, state.player_x, self.consts.PLAYER_START_Y, self.SHAPE_MASKS["player"])
         ball_x = jnp.where(state.game_started, state.ball_x, -10)
         ball_y = jnp.where(state.game_started, state.ball_y, -10)
-        frame_ball = jr.get_sprite_frame(self.SPRITE_BALL, 0)
-        raster = jr.render_at(raster, ball_x, ball_y, frame_ball)
+        raster = self.jr.render_at(raster, ball_x, ball_y, self.SHAPE_MASKS["ball"])
 
-        # 1. Create a mask for currently active blocks from the game state.
-        active_mask = (state.blocks == 1).flatten()
+        # --- 3. Draw blocks ---
+        # Create a grid of object IDs (1-6) based on the row.
+        row_ids = jnp.arange(1, self.consts.NUM_ROWS + 1)[:, None]
 
-        # 2. Apply the mask to the pre-computed rasters to zero out inactive blocks.
-        # The mask is reshaped to allow broadcasting across the raster dimensions.
-        masked_rasters = self.ALL_POSSIBLE_BLOCK_RASTERS * active_mask[:, None, None, None]
+        # Multiply by the existing block state (0s and 1s) to make empty cells 0.
+        object_id_grid = row_ids * state.blocks
 
-        # 3. Sum the masked rasters to create a single layer with all active blocks.
-        # Summation works because non-overlapping blocks were drawn on zeroed backgrounds.
-        blocks_layer = jnp.sum(masked_rasters, axis=0, dtype=jnp.uint8)
-
-        # 4. Add the block layer onto the main raster.
-        raster += blocks_layer
-
-        # 1. Get digit array
-        player_score_digits = jr.int_to_digits(state.score, max_digits=3)
-        player_lifes_digit = jr.int_to_digits(state.lives, max_digits=1)
-        number_players_digit = jr.int_to_digits(1, max_digits=1)
-
-        # score starts at 36, 5
-        # number of lives at 100, 5
-        # number players at 132, 5 (always 1 for us)
-
-        # 1. Render score
-        raster = jr.render_label_selective(raster, 36, 5,
-                                            player_score_digits, self.DIGIT_SPRITES,
-                                            0, 3,
-                                            spacing=16)
+        # The render call is now more general:
+        raster = self.jr.render_grid_inverse(
+            raster,
+            grid_state=object_id_grid,
+            grid_origin=(self.consts.BLOCK_START_X, self.consts.BLOCK_START_Y),
+            cell_size=self.consts.BLOCK_SIZE,
+            color_map=self.COLOR_MAP
+        )
         
-        # 2. Render number of lives
-        raster = jr.render_label_selective(raster, 100, 5,
-                                            player_lifes_digit, self.DIGIT_SPRITES,
-                                            0, 1,
-                                            spacing=16)
+        # --- 4. Draw UI and Finalize ---
+        player_score_digits = self.jr.int_to_digits(state.score, max_digits=3)
+        player_lifes_digit = self.jr.int_to_digits(state.lives, max_digits=1)
+        number_players_digit = self.jr.int_to_digits(1, max_digits=1)
+
+        raster = self.jr.render_label_selective(raster, 36, 5,
+                                    player_score_digits, self.SHAPE_MASKS['score_digits'],
+                                    0, 3,
+                                    spacing=16)
+
+        raster = self.jr.render_label_selective(raster, 100, 5,
+                                    player_lifes_digit, self.SHAPE_MASKS['score_digits'],
+                                    0, 1,
+                                    spacing=16)
         
         # 3. Render number of players
-        raster = jr.render_label_selective(raster, 132, 5,
-                                            number_players_digit, self.DIGIT_SPRITES,
+        raster = self.jr.render_label_selective(raster, 132, 5,
+                                            number_players_digit, self.SHAPE_MASKS['score_digits'],
                                             0, 1,
                                             spacing=16)
 
-        # after y=196 til y=210 render a black rectangle (its blocking the view of the ball)
-        # Frame is (Height, Width, Channels) so we index as [y_range, x_range, :]
-        # Force the last 14 rows (y=196 to y=210) to be black
-        raster = raster.at[196:210, :, :].set(0)
+        raster = self.jr.render_at(raster, 0, 196, self.SHAPE_MASKS['bottom_bar'])
 
-        return raster
+        # --- 5. Final Palette Lookup ---
+        return self.jr.render_from_palette(raster, self.PALETTE)

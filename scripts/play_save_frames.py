@@ -14,7 +14,7 @@ from PIL import Image
 
 from jaxatari.games.jax_kangaroo import KangarooState
 from jaxatari.environment import JAXAtariAction
-from utils import get_human_action, load_game_environment, load_game_mod, update_pygame
+from utils import get_human_action, load_game_environment, load_game_mods, update_pygame
 
 UPSCALE_FACTOR = 4
 
@@ -25,6 +25,7 @@ ACTION_NAMES = {
     if not k.startswith("_") and isinstance(v, int)
 }
 
+
 DEFAULT_SIZES = {
     "Platform": (128, 4),
     "Ladder":   (8, 35),   
@@ -32,7 +33,11 @@ DEFAULT_SIZES = {
     "Child":    (8, 15),
     "Fruit":    (7, 11),
     "Bell":     (6, 11),
+    "Monkey":   (6, 15),
+    "Coco":     (2, 3),
+    "FallingCoco":  (2, 3),
 }
+
 
 # eventually not relevant?
 def objects_to_string(struct_obs, defaults=DEFAULT_SIZES):
@@ -53,6 +58,7 @@ def objects_to_string(struct_obs, defaults=DEFAULT_SIZES):
         ("ladder_positions",   "Ladder"),
         ("fruit_positions",    "Fruit"),
         ("bell_positions",     "Bell"),
+        ("monkey_positions",   "Monkey"),
     ]:
         if key in struct_obs:
             w,h = defaults[label]
@@ -79,15 +85,100 @@ def xy(pos):
         return None
     return int(x), int(y)
 
-def objects_from_struct_obs(struct_obs: dict, default_sizes: dict):
+def objects_from_struct_obs(struct_obs: dict, state, renderer, default_sizes: dict, log_file):
     """
     Generic object extraction:
     - *_positions: list of (x,y)
     - *_position: single (x,y)
     - player_x/player_y: single (x,y)
     Everything becomes a list of dicts with category, x,y,w,h.
+    Width and height are dynamically determined from the renderer's sprites.
     """
     objs = []
+
+    animator_state = getattr(state, 'animator_state', None)
+
+    def get_size(category):
+        print(f"--- get_size for category: {category} ---", file=log_file)
+
+        # Default fallback
+        w, h = default_sizes.get(category, (0, 0))
+      
+        print(f"  Initial default size: ({w}, {h})", file=log_file)
+
+        # --- Start Monkey/Ape exception for Kangaroo ---
+        sprite_category = category
+        anim_category = category
+        if category.lower() == 'monkey' or category.lower() == 'ape':
+            sprite_category = 'ape'
+            anim_category = 'monkeys' # for monkeys_frame_idx
+
+        print(f"  Adjusted sprite_category: {sprite_category}, anim_category: {anim_category}", file=log_file)
+        # --- End Monkey/Ape exception ---
+
+        # Try to find sprite attribute on renderer
+        sprite_attr_plural = f"{sprite_category.lower()}_sprites"
+        sprite_attr_singular = f"{sprite_category.lower()}_sprite"
+
+        sprite_attr = None
+        if hasattr(renderer, sprite_attr_plural):
+            sprite_attr = sprite_attr_plural
+        elif hasattr(renderer, sprite_attr_singular):
+            sprite_attr = sprite_attr_singular
+        
+        print(f"  Found sprite_attr: {sprite_attr}", file=log_file)
+
+        if sprite_attr:
+            sprite_sheet = getattr(renderer, sprite_attr)
+            print(f"  Sprite sheet shape: {sprite_sheet.shape}", file=log_file)
+            
+            # Check for animation frame in state.animator_state
+            # Here we use anim_category
+            anim_attr = f"{anim_category.lower()}_frame"
+            anim_attr_idx = f"{anim_category.lower()}_frame_idx"
+
+            frame_idx = None
+            print(f"  Animator state exists: {animator_state is not None}", file=log_file)
+            if animator_state:
+                if hasattr(animator_state, anim_attr_idx):
+                    val = getattr(animator_state, anim_attr_idx)
+                    print(f"  Found anim_attr_idx ({anim_attr_idx}), value: {val}", file=log_file)
+                    # Handle array of indices (for monkeys) vs single index
+                    if isinstance(val, (list, tuple, np.ndarray, jax.Array)):
+                        if len(val) > 0:
+                            # Heuristic: assume all sprites for this category have the same size,
+                            # so we just take the frame index of the first instance.
+                            try:
+                                frame_idx = int(val[0])
+                            except (TypeError, ValueError):
+                                print(f"  Could not convert val[0] to int: {val[0]}", file=log_file)
+                                frame_idx = None # Ensure frame_idx is reset if conversion fails
+                    else:
+                        frame_idx = int(val)
+                elif hasattr(animator_state, anim_attr):
+                    frame_idx = int(getattr(animator_state, anim_attr))
+                    print(f"  Found anim_attr ({anim_attr}), frame_idx: {frame_idx}", file=log_file)
+
+            print(f"  Determined frame_idx: {frame_idx}", file=log_file)
+
+            if frame_idx is not None:
+                # Animated sprite sheet shape: (num_frames, h, w, c)
+                if len(sprite_sheet.shape) == 4 and frame_idx < sprite_sheet.shape[0]:
+                    sprite_frame = sprite_sheet[frame_idx]
+                    h, w = sprite_frame.shape[0], sprite_frame.shape[1]
+                    print(f"  Used animated sprite frame size: ({w}, {h})", file=log_file)
+                # Fallback for animated sprites if index is out of bounds or shape is wrong
+                elif len(sprite_sheet.shape) == 4:
+                     h, w = sprite_sheet.shape[1], sprite_sheet.shape[2]
+                     print(f"  Used animated sprite sheet default frame size: ({w}, {h})", file=log_file)
+
+            # Non-animated sprite shape: (h, w, c)
+            elif len(sprite_sheet.shape) == 3:
+                h, w = sprite_sheet.shape[0], sprite_sheet.shape[1]
+                print(f"  Used non-animated sprite size: ({w}, {h})", file=log_file)
+
+        print(f"--- Final size for category {category}: ({w}, {h}) ---", file=log_file)
+        return w, h
 
     def add_obj(category, x, y):
         if x is None or y is None:
@@ -95,7 +186,7 @@ def objects_from_struct_obs(struct_obs: dict, default_sizes: dict):
         x, y = int(x), int(y)
         if x == -1 or y == -1:
             return
-        w, h = default_sizes.get(category, (0, 0))
+        w, h = get_size(category)
         objs.append({"category": category, "x": x, "y": y, "w": int(w), "h": int(h)})
 
     # Special case: player_x/player_y naming (common)
@@ -194,6 +285,55 @@ def save_frame(image, path):
     img = Image.fromarray(np.array(image).astype(np.uint8))
     img.save(path)
 
+def expand_mods(game: str, mods):
+    """
+    Expands modpacks into a flat list of concrete mod names.
+    Assumes there is a mod registry accessible via load_game_mod_registry(game)
+    or inside load_game_mods module. Adjust `get_registry(...)` accordingly.
+    """
+    # Accept string or list
+    if mods is None:
+        return []
+    if isinstance(mods, str):
+        mods = [mods]
+
+    registry = load_game_mod_registry(game)  # <-- you need this accessor (see below)
+
+    expanded = []
+    seen = set()
+
+    def _expand(name):
+        if name in seen:
+            raise ValueError(f"Cycle detected in modpacks at: {name}")
+        seen.add(name)
+
+        entry = registry.get(name)
+        if entry is None:
+            # not a known modpack; assume it's a concrete mod name
+            expanded.append(name)
+            seen.remove(name)
+            return
+
+        # If registry maps name -> list, it's a modpack
+        if isinstance(entry, list):
+            for sub in entry:
+                _expand(sub)
+        else:
+            # registry maps name -> concrete mod class/function
+            expanded.append(name)
+
+        seen.remove(name)
+
+    for m in mods:
+        _expand(m)
+
+    # de-duplicate preserving order
+    out = []
+    for m in expanded:
+        if m not in out:
+            out.append(m)
+    return out
+
 
 def main():
     # --- dataset logging setup ---
@@ -202,7 +342,8 @@ def main():
 
 
     parser = argparse.ArgumentParser(
-        description="Play a JAXAtari game, record your actions or replay them."
+        description="Play a JAXAtari game, record your actions or replay them.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "-g",
@@ -214,6 +355,7 @@ def main():
     parser.add_argument(
         "-m", "--mod",
         type=str,
+        action="append",
         required=False,
         help="Name of the mod class.",
     )
@@ -280,12 +422,19 @@ def main():
     save_dir = os.path.join(os.getcwd(), "frames", args.output_folder)
     os.makedirs(save_dir, exist_ok=True)
 
+    log_file_path = os.path.join(save_dir, 'get_size_debug.log')
+    log_file = open(log_file_path, 'w')
+
     execute_without_rendering = False
     # Load the game environment
     try:
         env, renderer = load_game_environment(args.game)
+        print("--- Renderer Info ---")
+        print(f"Renderer type: {type(renderer)}")
+        print(f"Renderer attributes: {dir(renderer)}")
+        print("---------------------")
         if args.mod is not None:
-            mod = load_game_mod(args.game, args.mod)
+            mod = load_game_mods(args.game, args.mod)
             env = mod(env)
 
         if renderer is None:
@@ -304,6 +453,7 @@ def main():
 
     # initialize the environment
     obs, state = jitted_reset(key)
+    prev_state = state
     obs_to_json(obs, os.path.join(save_dir, f"initial_obs.json"))
 
     def struct_from_obs(o):
@@ -422,6 +572,7 @@ def main():
         if not frame_by_frame or next_frame_asked:
             action = get_human_action()
             prev_obs = obs
+            prev_state = state
             
             # Step environment
             next_obs, state, reward, done, info = jitted_step(state, action)
@@ -438,9 +589,10 @@ def main():
                 prev_struct = struct_from_obs(prev_obs)
                 next_struct = struct_from_obs(next_obs)
 
-                prev_objs = objects_from_struct_obs(prev_struct, DEFAULT_SIZES)
-                next_objs = objects_from_struct_obs(next_struct, DEFAULT_SIZES)
+                prev_objs = objects_from_struct_obs(prev_struct, prev_state, renderer, DEFAULT_SIZES, log_file)
+                next_objs = objects_from_struct_obs(next_struct, state, renderer, DEFAULT_SIZES, log_file)
 
+                
                 cocos = prev_struct.get("coco_positions", [])
                 if any((x != -1 and y != -1) for x, y in cocos):
                     print("FOUND COCO:", cocos)
@@ -455,7 +607,6 @@ def main():
                     "index": f"{episode:05d}_{save_idx:05d}",
                     "obs": prev_image,
                     "next_obs": next_image,
-                    "struct": prev_struct,
                     "objects": objects_to_string_from_list(prev_objs),
                     "next_objects": objects_to_string_from_list(next_objs),
                     "action": np.float32(action),              
@@ -474,6 +625,7 @@ def main():
                 save_idx += 1
 
             # Advance to next step
+            obs = next_obs
             prev_struct = struct_from_obs(next_obs)
             prev_image = next_image
             step_idx += 1
@@ -512,12 +664,14 @@ def main():
     if rows:
         import pandas as pd
         df = pd.DataFrame(rows, columns=[
-            "index", "obs", "next_obs", "struct", "objects", "next_objects",
+            "index", "obs", "next_obs", "objects", "next_objects",
             "action", "reward", "original_reward", "done"
         ])
         out_pkl = os.path.join(save_dir, f"dataset_{episode}.pkl")
         df.to_pickle(out_pkl)
         print(f"Wrote {len(df)} transitions to {out_pkl}")
+    
+    log_file.close()
 
     pygame.quit()
 

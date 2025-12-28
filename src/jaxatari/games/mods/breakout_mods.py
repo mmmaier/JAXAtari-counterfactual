@@ -1,36 +1,41 @@
-import functools
-import jax
+from jaxatari.modification import JaxAtariModController
+from jaxatari.games.mods.breakout_mod_plugins import (
+    SpeedModeMod,
+    SmallPaddleMod,
+    BigPaddleMod,
+    BallDriftMod,
+    BallGravityMod,
+    BallColorMod,
+    BlockColorMod,
+    PlayerColorMod,
+)
 
-from jaxatari.wrappers import JaxatariWrapper
+class BreakoutEnvMod(JaxAtariModController):
+    """
+    Game-specific Mod Controller for Breakout.
+    It simply inherits all logic from JaxAtariModController and defines the BREAKOUT_MOD_REGISTRY.
+    """
 
-class SpeedMode(JaxatariWrapper):
-    """Increase speed to maximum at all time steps."""
-    def __init__(self, env):
-        super().__init__(env)
-        self._env = env
-        # Overrides get_ball_velocity from env
-        self._env.get_ball_velocity = self.get_ball_velocity.__get__(self._env, self._env.__class__) 
+    REGISTRY = {
+        "speed_mode": SpeedModeMod,
+        "small_paddle": SmallPaddleMod,
+        "big_paddle": BigPaddleMod,
+        "ball_drift": BallDriftMod,
+        "ball_gravity": BallGravityMod,
+        "ball_color": BallColorMod,
+        "block_color": BlockColorMod,
+        "player_color": PlayerColorMod,
+    }
 
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def get_ball_velocity(self, speed_idx, direction_idx, step_counter):
-        """Returns the ball's velocity based on the speed and direction indices."""
-        # Overrides the default function from the env
-        direction = self._env.consts.BALL_DIRECTIONS[direction_idx]
-        speed = 3
-        return speed * direction[0], speed * direction[1]
+    def __init__(self,
+                 env,
+                 mods_config: list = [],
+                 allow_conflicts: bool = False
+                 ):
 
-class SmallPaddle(JaxatariWrapper):
-    """Always use a small paddle."""
-    def __init__(self, env):
-        super().__init__(env)
-        self._env = env
-        self._env.consts.PLAYER_SIZE = (4, 4)
-        self._env.consts.PLAYER_SIZE_SMALL = (4, 4)
-
-class BigPaddle(JaxatariWrapper):
-    """Always use a bigger paddle."""
-    def __init__(self, env):
-        super().__init__(env)
-        self._env = env
-        self._env.consts.PLAYER_SIZE = (40, 4)
-        self._env.consts.PLAYER_SIZE_SMALL = (40, 4)
+        super().__init__(
+            env=env,
+            mods_config=mods_config,
+            allow_conflicts=allow_conflicts,
+            registry=self.REGISTRY
+        )
