@@ -12,7 +12,6 @@ import os
 
 from PIL import Image
 
-from jaxatari.games.jax_kangaroo import KangarooState
 from jaxatari.environment import JAXAtariAction
 from utils import get_human_action, load_game_environment, load_game_mods, update_pygame
 
@@ -27,15 +26,12 @@ ACTION_NAMES = {
 
 
 DEFAULT_SIZES = {
-    "Platform": (128, 4),
-    "Ladder":   (8, 35),   
-    "Player":   (8, 24),
-    "Child":    (8, 15),
-    "Fruit":    (7, 11),
-    "Bell":     (6, 11),
-    "Monkey":   (6, 15),
-    "Coco":     (2, 3),
-    "FallingCoco":  (2, 3),
+    "Player":   (16, 11),
+    "Submarine": (8, 11),
+    "Diver": (8, 11),
+    "Enemy_Missile": (8, 1),
+    "Shark": (7, 8),
+
 }
 
 
@@ -85,141 +81,83 @@ def xy(pos):
         return None
     return int(x), int(y)
 
-def objects_from_struct_obs(struct_obs: dict, state, renderer, default_sizes: dict, log_file):
+
+def objects_from_struct_obs(struct_obs: dict):
     """
-    Generic object extraction:
-    - *_positions: list of (x,y)
-    - *_position: single (x,y)
-    - player_x/player_y: single (x,y)
-    Everything becomes a list of dicts with category, x,y,w,h.
-    Width and height are dynamically determined from the renderer's sprites.
+    Extract objects into list of dicts:
+      {"category": str, "x": int, "y": int, "w": int, "h": int}
+
+    Supports:
+    - Seaquest: entity NamedTuples (x,y,width,height,active)
+    - Seaquest: tables rows [x,y,w,h,active]
+    - Kangaroo: *_positions / *_position patterns [x,y], [[x,y]], [[x,y],...]
+    Ignores scalar metadata like lives/oxygen automatically.
     """
     objs = []
 
-    animator_state = getattr(state, 'animator_state', None)
+    def norm_category(key: str) -> str:
+        # "enemy_missiles" -> "EnemyMissile", "player_missile" -> "PlayerMissile"
+        name = key.replace("_", " ").title().replace(" ", "")
+        if name.endswith("ies"):
+            name = name[:-3] + "y"
+        elif name.endswith("s"):
+            name = name[:-1]
+        return name
 
-    def get_size(category):
-        print(f"--- get_size for category: {category} ---", file=log_file)
-
-        # Default fallback
-        w, h = default_sizes.get(category, (0, 0))
-      
-        print(f"  Initial default size: ({w}, {h})", file=log_file)
-
-        # --- Start Monkey/Ape exception for Kangaroo ---
-        sprite_category = category
-        anim_category = category
-        if category.lower() == 'monkey' or category.lower() == 'ape':
-            sprite_category = 'ape'
-            anim_category = 'monkeys' # for monkeys_frame_idx
-
-        print(f"  Adjusted sprite_category: {sprite_category}, anim_category: {anim_category}", file=log_file)
-        # --- End Monkey/Ape exception ---
-
-        # Try to find sprite attribute on renderer
-        sprite_attr_plural = f"{sprite_category.lower()}_sprites"
-        sprite_attr_singular = f"{sprite_category.lower()}_sprite"
-
-        sprite_attr = None
-        if hasattr(renderer, sprite_attr_plural):
-            sprite_attr = sprite_attr_plural
-        elif hasattr(renderer, sprite_attr_singular):
-            sprite_attr = sprite_attr_singular
-        
-        print(f"  Found sprite_attr: {sprite_attr}", file=log_file)
-
-        if sprite_attr:
-            sprite_sheet = getattr(renderer, sprite_attr)
-            print(f"  Sprite sheet shape: {sprite_sheet.shape}", file=log_file)
-            
-            # Check for animation frame in state.animator_state
-            # Here we use anim_category
-            anim_attr = f"{anim_category.lower()}_frame"
-            anim_attr_idx = f"{anim_category.lower()}_frame_idx"
-
-            frame_idx = None
-            print(f"  Animator state exists: {animator_state is not None}", file=log_file)
-            if animator_state:
-                if hasattr(animator_state, anim_attr_idx):
-                    val = getattr(animator_state, anim_attr_idx)
-                    print(f"  Found anim_attr_idx ({anim_attr_idx}), value: {val}", file=log_file)
-                    # Handle array of indices (for monkeys) vs single index
-                    if isinstance(val, (list, tuple, np.ndarray, jax.Array)):
-                        if len(val) > 0:
-                            # Heuristic: assume all sprites for this category have the same size,
-                            # so we just take the frame index of the first instance.
-                            try:
-                                frame_idx = int(val[0])
-                            except (TypeError, ValueError):
-                                print(f"  Could not convert val[0] to int: {val[0]}", file=log_file)
-                                frame_idx = None # Ensure frame_idx is reset if conversion fails
-                    else:
-                        frame_idx = int(val)
-                elif hasattr(animator_state, anim_attr):
-                    frame_idx = int(getattr(animator_state, anim_attr))
-                    print(f"  Found anim_attr ({anim_attr}), frame_idx: {frame_idx}", file=log_file)
-
-            print(f"  Determined frame_idx: {frame_idx}", file=log_file)
-
-            if frame_idx is not None:
-                # Animated sprite sheet shape: (num_frames, h, w, c)
-                if len(sprite_sheet.shape) == 4 and frame_idx < sprite_sheet.shape[0]:
-                    sprite_frame = sprite_sheet[frame_idx]
-                    h, w = sprite_frame.shape[0], sprite_frame.shape[1]
-                    print(f"  Used animated sprite frame size: ({w}, {h})", file=log_file)
-                # Fallback for animated sprites if index is out of bounds or shape is wrong
-                elif len(sprite_sheet.shape) == 4:
-                     h, w = sprite_sheet.shape[1], sprite_sheet.shape[2]
-                     print(f"  Used animated sprite sheet default frame size: ({w}, {h})", file=log_file)
-
-            # Non-animated sprite shape: (h, w, c)
-            elif len(sprite_sheet.shape) == 3:
-                h, w = sprite_sheet.shape[0], sprite_sheet.shape[1]
-                print(f"  Used non-animated sprite size: ({w}, {h})", file=log_file)
-
-        print(f"--- Final size for category {category}: ({w}, {h}) ---", file=log_file)
-        return w, h
-
-    def add_obj(category, x, y):
-        if x is None or y is None:
+    def add_obj(category, x, y, w=None, h=None, active=True):
+        if not active or x is None or y is None:
             return
         x, y = int(x), int(y)
         if x == -1 or y == -1:
             return
-        w, h = get_size(category)
-        objs.append({"category": category, "x": x, "y": y, "w": int(w), "h": int(h)})
-
-    # Special case: player_x/player_y naming (common)
-    if "player_x" in struct_obs and "player_y" in struct_obs:
-        add_obj("Player", struct_obs["player_x"], struct_obs["player_y"])
+        w = int(w) if w is not None else 0
+        h = int(h) if h is not None else 0
+        objs.append({"category": category, "x": x, "y": y, "w": w, "h": h})
 
     for key, val in struct_obs.items():
-        # skip player_x/player_y since handled above
-        if key in ("player_x", "player_y"):
-            continue
+        category = norm_category(key)
 
-        # list of positions: e.g., fruit_positions, ladder_positions
-        if key.endswith("_positions") and isinstance(val, (list, tuple)):
-            category = key[:-10].replace("_", " ").title().replace(" ", "")  # fruit_positions -> Fruit
-            for xy in val:
-                if isinstance(xy, (list, tuple)) and len(xy) >= 2:
-                    add_obj(category, xy[0], xy[1])
+        # A) NamedTuple/entity objects (Seaquest)
+        if hasattr(val, "_asdict"):
+            d = val._asdict()
+            if all(k in d for k in ("x", "y", "width", "height")):
+                active = d.get("active", True)
+                add_obj(category, d["x"], d["y"], d["width"], d["height"], active=bool(active))
+                continue
 
-        # single position: e.g., child_position, bell_position
-        elif key.endswith("_position") and isinstance(val, (list, tuple)):
-            category = key[:-9].replace("_", " ").title().replace(" ", "")  # child_position -> Child
+        # B) Seaquest tables: [[x,y,w,h,active], ...]
+        if isinstance(val, (list, tuple)) and len(val) > 0 and isinstance(val[0], (list, tuple)):
+            row0 = val[0]
 
-            # Case A: [x, y]
+            # Seaquest table row
+            if len(row0) >= 5:
+                for row in val:
+                    if len(row) < 5:
+                        continue
+                    x, y, w, h, active = row[:5]
+                    add_obj(category, x, y, w, h, active=(float(active) != 0.0))
+                continue
+
+            # Kangaroo-style positions list: [[x,y], ...] (also safely ignores [] entries)
+            if len(row0) >= 2:
+                for row in val:
+                    if isinstance(row, (list, tuple)) and len(row) >= 2:
+                        add_obj(category, row[0], row[1])
+                continue
+
+        # C) Kangaroo single position: [x,y] or [[x,y]]
+        if isinstance(val, (list, tuple)):
             if len(val) >= 2 and isinstance(val[0], (int, float)) and isinstance(val[1], (int, float)):
                 add_obj(category, val[0], val[1])
+                continue
+            if len(val) == 1 and isinstance(val[0], (list, tuple)) and len(val[0]) >= 2:
+                add_obj(category, val[0][0], val[0][1])
+                continue
 
-            # Case B: [[x, y]] or [[x, y], [x2, y2], ...]
-            elif len(val) >= 1 and isinstance(val[0], (list, tuple)) and len(val[0]) >= 2:
-                for xy in val:
-                    if isinstance(xy, (list, tuple)) and len(xy) >= 2:
-                        add_obj(category, xy[0], xy[1])
+        # Scalars (lives, oxygen_level, score...) fall through and are ignored.
 
     return objs
+
 
 
 def objects_to_string_from_list(objs):
@@ -469,6 +407,8 @@ def main():
     prev_state = state
     obs_to_json(obs, os.path.join(save_dir, f"initial_obs.json"))
 
+    #import ipdb; ipdb.set_trace()
+
     def struct_from_obs(o):
         return {name: (value.tolist() if isinstance(value, (np.ndarray, jax.Array)) else value)
                 for name, value in o._asdict().items()}
@@ -602,8 +542,8 @@ def main():
                 prev_struct = struct_from_obs(prev_obs)
                 next_struct = struct_from_obs(next_obs)
 
-                prev_objs = objects_from_struct_obs(prev_struct, prev_state, renderer, DEFAULT_SIZES, log_file)
-                next_objs = objects_from_struct_obs(next_struct, state, renderer, DEFAULT_SIZES, log_file)
+                prev_objs = objects_from_struct_obs(prev_struct)
+                next_objs = objects_from_struct_obs(next_struct)
 
                 
                 cocos = prev_struct.get("coco_positions", [])
